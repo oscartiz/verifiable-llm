@@ -106,6 +106,9 @@ enum Command {
         /// Max per-element |delta| for recomputed logits.
         #[arg(long)]
         logits_tolerance: Option<f32>,
+        /// Max mean |delta| per challenged cell (bounded-drift detector).
+        #[arg(long, default_value_t = vllm_verify::DEFAULT_MEAN_TOLERANCE)]
+        mean_tolerance: f32,
     },
 }
 
@@ -189,6 +192,7 @@ fn main() -> Result<()> {
             response,
             tolerance,
             logits_tolerance,
+            mean_tolerance,
         } => cmd_verify(
             &commitment,
             &model,
@@ -196,6 +200,7 @@ fn main() -> Result<()> {
             &response,
             tolerance,
             logits_tolerance,
+            mean_tolerance,
         ),
     }
 }
@@ -254,6 +259,7 @@ fn cmd_respond(commitment: &Path, trace: &Path, challenge: &Path, out: &Path) ->
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_verify(
     commitment: &Path,
     model: &Path,
@@ -261,6 +267,7 @@ fn cmd_verify(
     response: &Path,
     tolerance: f32,
     logits_tolerance: Option<f32>,
+    mean_tolerance: f32,
 ) -> Result<()> {
     let transcript: Transcript = read_json(commitment)?;
     let challenge: vllm_core::protocol::Challenge = read_json(challenge)?;
@@ -268,21 +275,24 @@ fn cmd_verify(
     let config = vllm_verify::VerifyConfig {
         tolerance,
         logits_tolerance: logits_tolerance.unwrap_or(tolerance),
+        mean_tolerance,
     };
     let t0 = Instant::now();
     let report = vllm_verify::verify(model, &transcript, &challenge, &response, &config)?;
     for item in &report.items {
         eprintln!(
-            "  cell (pos {:>4}, layer {:>2}) ok, max |delta| {:.3e}",
-            item.pos, item.layer, item.max_dev
+            "  cell (pos {:>4}, layer {:>2}) ok, max |delta| {:.3e}, mean {:.3e}",
+            item.pos, item.layer, item.max_dev, item.mean_dev
         );
     }
     eprintln!(
-        "OK: {} challenges verified in {:.2?}; worst deviation {:.3e} (tolerance {})",
+        "OK: {} challenges verified in {:.2?}; worst max {:.3e} (tolerance {}), worst mean {:.3e} (mean tolerance {})",
         report.items.len(),
         t0.elapsed(),
         report.max_dev,
-        config.tolerance
+        config.tolerance,
+        report.max_mean_dev,
+        config.mean_tolerance
     );
     Ok(())
 }

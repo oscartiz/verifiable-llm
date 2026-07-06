@@ -378,6 +378,50 @@ impl ModelWeights {
         self.output.forward(&x)
     }
 
+    /// Forward pass where the hook may REPLACE intermediate hidden states —
+    /// the injection point for adversarial evaluation of the v0.2 tolerance
+    /// (see REPORT.md). Hook points match [`Self::forward_traced`]: entering
+    /// block `j` for j in 0..n_layers, then exiting the last block. Returning
+    /// `Some(t)` substitutes the state; the perturbed state feeds all
+    /// downstream computation, including this position's KV cache — exactly
+    /// like a self-consistent cheating trace.
+    pub fn forward_perturbed(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        perturb: &mut dyn FnMut(usize, &Tensor) -> Result<Option<Tensor>>,
+    ) -> Result<Tensor> {
+        let (_b_sz, seq_len) = x.dims2()?;
+        let mask = if seq_len == 1 {
+            None
+        } else {
+            Some(self.mask(seq_len, index_pos, x.device())?)
+        };
+        let mut layer_in = self.tok_embeddings.forward(x)?;
+        for (j, layer) in self.layers.iter_mut().enumerate() {
+            if let Some(replacement) = perturb(j, &layer_in)? {
+                layer_in = replacement;
+            }
+            layer_in = layer.forward(&layer_in, mask.as_ref(), index_pos)?;
+        }
+        if let Some(replacement) = perturb(self.layers.len(), &layer_in)? {
+            layer_in = replacement;
+        }
+        let x = self.norm.forward(&layer_in)?;
+        let x = x.i((.., seq_len - 1, ..))?;
+        self.output.forward(&x)
+    }
+
+    /// Dequantized LM-head weight `[vocab, dim]` (~1 GB f32 for a 128k
+    /// vocab; used by adversarial evaluation to compute targeted attack
+    /// directions, not by inference).
+    pub fn lm_head_weight(&self, device: &Device) -> Result<Tensor> {
+        match &self.output {
+            QMatMul::QTensor(qt) => qt.dequantize(device),
+            QMatMul::Tensor(t) | QMatMul::TensorF16(t) => t.to_dtype(DType::F32),
+        }
+    }
+
     /// Re-execute a single block over a prefix of hidden states, from
     /// position 0, with a fresh KV cache and a causal mask — the verifier's
     /// single-layer check. `h` is `[1, seq, dim]` (hidden states entering

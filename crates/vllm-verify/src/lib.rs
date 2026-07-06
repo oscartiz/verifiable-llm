@@ -38,12 +38,21 @@ use vllm_infer::model::ModelWeights;
 /// same-backend verification.
 pub const DEFAULT_TOLERANCE: f32 = 0.5;
 
+/// Default max mean |Δ| per challenged cell; see [`VerifyConfig`] and
+/// DECISIONS.md #15 for the calibration.
+pub const DEFAULT_MEAN_TOLERANCE: f32 = 0.05;
+
 #[derive(Debug, Clone, Copy)]
 pub struct VerifyConfig {
     /// Max per-element |Δ| for block outputs and embeddings.
     pub tolerance: f32,
     /// Max per-element |Δ| for recomputed logits (head challenges).
     pub logits_tolerance: f32,
+    /// Max MEAN |Δ| per challenged cell. Honest backend drift concentrates
+    /// far below the per-element tolerance, while the bounded-drift attack
+    /// (REPORT.md) must spend the whole budget at nearly every coordinate —
+    /// the mean separates the two by ~2 orders of magnitude.
+    pub mean_tolerance: f32,
 }
 
 impl Default for VerifyConfig {
@@ -51,6 +60,7 @@ impl Default for VerifyConfig {
         VerifyConfig {
             tolerance: DEFAULT_TOLERANCE,
             logits_tolerance: DEFAULT_TOLERANCE,
+            mean_tolerance: DEFAULT_MEAN_TOLERANCE,
         }
     }
 }
@@ -61,6 +71,8 @@ pub struct ItemReport {
     pub layer: u32,
     /// Max |Δ| between recomputation and committed values.
     pub max_dev: f32,
+    /// Mean |Δ| over the compared vector.
+    pub mean_dev: f32,
 }
 
 #[derive(Debug)]
@@ -68,6 +80,8 @@ pub struct VerifyReport {
     pub items: Vec<ItemReport>,
     /// Largest deviation across all checks (for tolerance calibration).
     pub max_dev: f32,
+    /// Largest per-cell mean deviation across all checks.
+    pub max_mean_dev: f32,
 }
 
 /// Reconstruct the TraceMeta the transcript commits to.
@@ -175,6 +189,7 @@ pub fn verify(
 
     let mut items = Vec::with_capacity(response.items.len());
     let mut max_dev = 0f32;
+    let mut max_mean_dev = 0f32;
     for (item, &cell) in response.items.iter().zip(&challenge.cells) {
         if item.cell != cell {
             bail!(
@@ -183,22 +198,28 @@ pub fn verify(
                 cell.layer
             );
         }
-        let dev = if cell.layer < meta.n_layers {
+        let (dev, mean) = if cell.layer < meta.n_layers {
             verify_block(&mut model, transcript, &meta, item, config, &device)?
         } else {
             verify_head(&model, transcript, &meta, item, config, &device)?
         };
         max_dev = max_dev.max(dev);
+        max_mean_dev = max_mean_dev.max(mean);
         items.push(ItemReport {
             pos: cell.pos,
             layer: cell.layer,
             max_dev: dev,
+            mean_dev: mean,
         });
     }
-    Ok(VerifyReport { items, max_dev })
+    Ok(VerifyReport {
+        items,
+        max_dev,
+        max_mean_dev,
+    })
 }
 
-/// Check one block challenge; returns the max deviation observed.
+/// Check one block challenge; returns (max, mean) deviation observed.
 fn verify_block(
     model: &mut ModelWeights,
     transcript: &Transcript,
@@ -206,7 +227,7 @@ fn verify_block(
     item: &vllm_core::protocol::ResponseItem,
     config: &VerifyConfig,
     device: &Device,
-) -> Result<f32> {
+) -> Result<(f32, f32)> {
     let cell = item.cell;
     let seq = cell.pos as usize + 1;
     if item.inputs.len() != seq {
@@ -279,9 +300,13 @@ fn verify_block(
     let out = model.forward_block(cell.layer as usize, &h, seq)?;
     let recomputed: Vec<f32> = out.i((0, seq - 1, ..))?.to_vec1()?;
     let mut dev = 0f32;
+    let mut sum = 0f64;
     for (a, b) in recomputed.iter().zip(&committed_out) {
-        dev = dev.max((a - b).abs());
+        let d = (a - b).abs();
+        dev = dev.max(d);
+        sum += d as f64;
     }
+    let mean = (sum / recomputed.len() as f64) as f32;
     if dev > config.tolerance {
         bail!(
             "challenge ({}, {}): recomputed block output deviates by {dev} (tolerance {})",
@@ -290,10 +315,19 @@ fn verify_block(
             config.tolerance
         );
     }
-    Ok(max_dev.max(dev))
+    if mean > config.mean_tolerance {
+        bail!(
+            "challenge ({}, {}): mean deviation {mean} exceeds {} — committed outputs are \
+             uniformly displaced from the recomputation (bounded-drift attack signature)",
+            cell.pos,
+            cell.layer,
+            config.mean_tolerance
+        );
+    }
+    Ok((max_dev.max(dev), mean))
 }
 
-/// Check one head challenge; returns the max deviation observed.
+/// Check one head challenge; returns (max, mean) deviation observed.
 fn verify_head(
     model: &ModelWeights,
     transcript: &Transcript,
@@ -301,7 +335,7 @@ fn verify_head(
     item: &vllm_core::protocol::ResponseItem,
     config: &VerifyConfig,
     device: &Device,
-) -> Result<f32> {
+) -> Result<(f32, f32)> {
     let cell = item.cell;
     let step = (cell.pos - meta.first_logit_pos) as usize;
     let record = transcript
@@ -352,9 +386,13 @@ fn verify_head(
     let h = Tensor::from_vec(hidden, (1, 1, meta.hidden_dim as usize), device)?;
     let recomputed: Vec<f32> = model.lm_head(&h)?.flatten_all()?.to_vec1()?;
     let mut dev = 0f32;
+    let mut sum = 0f64;
     for (a, b) in recomputed.iter().zip(&revealed) {
-        dev = dev.max((a - b).abs());
+        let d = (a - b).abs();
+        dev = dev.max(d);
+        sum += d as f64;
     }
+    let mean = (sum / recomputed.len() as f64) as f32;
     if dev > config.logits_tolerance {
         bail!(
             "head challenge at pos {}: recomputed logits deviate by {dev} (tolerance {})",
@@ -362,5 +400,13 @@ fn verify_head(
             config.logits_tolerance
         );
     }
-    Ok(dev)
+    if mean > config.mean_tolerance {
+        bail!(
+            "head challenge at pos {}: mean logit deviation {mean} exceeds {} (bounded-drift \
+             attack signature)",
+            cell.pos,
+            config.mean_tolerance
+        );
+    }
+    Ok((dev, mean))
 }

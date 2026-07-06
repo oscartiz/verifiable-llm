@@ -187,3 +187,17 @@ carries a full-range difference so every bit column stays non-degenerate
 under winterfell's debug-mode degree checks regardless of input. The
 degree-7 backward-direction round constraint (inverse S-box trick) forces
 blowup 8.
+
+## 15. Mean-deviation check (bounded-drift detector)
+
+The bounded-drift experiment (REPORT.md) showed per-element tolerance alone
+admits token steering at any usable τ: the attack must spend its budget at
+nearly every coordinate, while honest backend drift concentrates ~2 orders
+of magnitude below its own max (measured Metal→CPU per-cell mean ≤ 8e-3 vs
+max 4.4e-2, 40 real-model challenges). `vllm verify` therefore enforces a
+second, distributional bound: mean |Δ| per challenged cell ≤ 0.05 by
+default (`--mean-tolerance`; ~6x headroom over honest). Tested: a uniform
++0.04 shift of one cell passes the per-element check and is rejected by the
+mean check. Stated plainly in REPORT.md: this narrows the attack ~10x, it
+does not close it — exact token integrity requires deterministic integer
+inference (roadmap v0.4).

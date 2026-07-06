@@ -154,11 +154,14 @@ empty-nonce mode remains useful for self-audit and archival transcripts.
 **What v0.2 does not close.** Re-execution is tolerance-based (float drift
 across backends, measured max ≈ 5e-2 per block CPU↔Metal on the 1B model,
 default tolerance 0.5). An adversary may therefore inject perturbations
-below the tolerance at every cell — a bounded-drift attack, not a free
-lunch: every committed cell must still be within tolerance of the true
-computation, so the reachable output set is severely constrained. Tighten
-`--tolerance` to the same-backend noise floor (~1e-3) when prover and
-verifier share a backend.
+below the tolerance at every cell. **REPORT.md quantifies this attack on
+the real model**: the network amplifies sub-tolerance drift ~30–80×, and
+token steering is feasible even at τ = 0.01. The verifier therefore also
+enforces a per-cell *mean* deviation bound (`--mean-tolerance`, default
+0.05 vs measured honest ≤ 8e-3), which caps the adversary's average budget
+~10× but does not eliminate steering. The guarantee Layer 2 delivers is
+*drift-bounded computation with the committed weights* — exact token
+provenance needs deterministic (integer-only) inference, the natural v0.4.
 
 ## The decode proof (v0.3)
 

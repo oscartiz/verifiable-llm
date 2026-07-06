@@ -9,7 +9,7 @@ use vllm_core::protocol::{build_response, make_challenge};
 use vllm_core::trace::{TraceBuilder, TraceReader, dequantize};
 use vllm_core::transcript::{ChainCheck, TraceInfo, Transcript};
 use vllm_infer::engine::{GenerateRequest, Prompt, generate};
-use vllm_infer::testmodel::tiny_llama_gguf;
+use vllm_infer::testmodel::{LAYERS, tiny_llama_gguf};
 use vllm_verify::{VerifyConfig, verify};
 
 const PROMPT: [u32; 3] = [1, 2, 3];
@@ -83,6 +83,7 @@ fn honest_prover_verifies() {
     let config = VerifyConfig {
         tolerance: 0.05,
         logits_tolerance: 0.05,
+        mean_tolerance: 0.05,
     };
     let report = verify(&s.model_path, &s.transcript, &challenge, &response, &config).unwrap();
     assert_eq!(report.items.len(), 28);
@@ -95,13 +96,13 @@ fn honest_prover_verifies() {
     cleanup(&s);
 }
 
-/// The critical adversary: a prover whose commitments are fully
-/// self-consistent (valid chain, valid Merkle tree, valid trace file) but
-/// whose trace does not match the committed model's computation. Simulated
-/// by perturbing one activation cell and rebuilding every hash honestly.
-#[test]
-fn self_consistent_cheater_is_caught() {
-    let s = honest_run("cheat");
+/// Rebuild a fully self-consistent cheating (trace file, transcript) from
+/// an honest run, applying `perturb(pos, layer, values)` to every cell.
+fn rebuild_cheating(
+    s: &Setup,
+    tag: &str,
+    perturb: impl Fn(u32, u32, &mut Vec<f32>),
+) -> (PathBuf, Transcript) {
     let trace_info = s.transcript.trace.clone().unwrap();
     let (n_layers, dim, fb) = (
         trace_info.n_layers,
@@ -110,7 +111,6 @@ fn self_consistent_cheater_is_caught() {
     );
     let cells_per_pos = n_layers + 1;
 
-    // Read the honest trace and rebuild it with one perturbed cell.
     let mut reader = TraceReader::open(&s.trace_path).unwrap();
     let meta = reader.meta().clone();
     let mut builder = TraceBuilder::new(
@@ -123,9 +123,7 @@ fn self_consistent_cheater_is_caught() {
     for pos in 0..meta.n_positions {
         for layer in 0..cells_per_pos {
             let mut values = dequantize(&reader.cell(pos, layer).unwrap(), fb);
-            if pos == 5 && layer == 1 {
-                values[0] += 1.0; // the lie
-            }
+            perturb(pos, layer, &mut values);
             builder.push_cell(&values).unwrap();
         }
     }
@@ -133,7 +131,7 @@ fn self_consistent_cheater_is_caught() {
         builder.push_logits_row(reader.logits_row(step).unwrap());
     }
     let hashes = builder.hashes().to_vec();
-    let cheat_trace_path = temp_path("cheat-rebuilt", "trace");
+    let cheat_trace_path = temp_path(tag, "trace");
     let cheat_meta = builder.write(&cheat_trace_path).unwrap();
 
     // Rebuild the chain and transcript exactly as an honest prover would,
@@ -161,12 +159,26 @@ fn self_consistent_cheater_is_caught() {
         frac_bits: fb,
     });
 
-    // The cheating transcript is internally perfect…
+    // The cheating commitments are internally perfect.
     assert_eq!(t.replay_chain(), ChainCheck::Ok);
     t.check_trace_binding().unwrap();
+    (cheat_trace_path, t)
+}
 
-    // …but re-execution catches it: with the space exhausted, challenge
-    // (5, 0) recomputes block 0 over honest inputs and disagrees with the
+/// The critical adversary: a prover whose commitments are fully
+/// self-consistent (valid chain, valid Merkle tree, valid trace file) but
+/// whose trace does not match the committed model's computation.
+#[test]
+fn self_consistent_cheater_is_caught() {
+    let s = honest_run("cheat");
+    let (cheat_trace_path, t) = rebuild_cheating(&s, "cheat-rebuilt", |pos, layer, values| {
+        if pos == 5 && layer == 1 {
+            values[0] += 1.0; // the lie
+        }
+    });
+
+    // Re-execution catches it: with the space exhausted, challenge (5, 0)
+    // recomputes block 0 over honest inputs and disagrees with the
     // perturbed committed output.
     let challenge = make_challenge(&t, K_ALL, "test-nonce").unwrap();
     let mut cheat_reader = TraceReader::open(&cheat_trace_path).unwrap();
@@ -174,10 +186,58 @@ fn self_consistent_cheater_is_caught() {
     let config = VerifyConfig {
         tolerance: 0.05,
         logits_tolerance: 0.05,
+        mean_tolerance: 0.05,
     };
     let err = verify(&s.model_path, &t, &challenge, &response, &config).unwrap_err();
     assert!(
         err.to_string().contains("deviates"),
+        "unexpected error: {err}"
+    );
+
+    std::fs::remove_file(&cheat_trace_path).ok();
+    cleanup(&s);
+}
+
+/// The bounded-drift adversary (REPORT.md): shift every element of one cell
+/// by an amount BELOW the per-element tolerance. The cell is the last-layer
+/// state of a PROMPT position, which is only ever checked as a block output
+/// (uniform, unamplified deviation) — the per-element max check passes, and
+/// only the distributional (mean) check catches it. Perturbing an *input*
+/// cell instead gets amplified by downstream re-execution and trips the max
+/// check (see self_consistent_cheater_is_caught).
+#[test]
+fn bounded_drift_is_caught_by_mean_check() {
+    let s = honest_run("drift");
+    let (cheat_trace_path, t) = rebuild_cheating(&s, "drift-rebuilt", |pos, layer, values| {
+        if pos == 1 && layer == LAYERS {
+            for v in values.iter_mut() {
+                *v += 0.04; // under the 0.05 per-element tolerance, everywhere
+            }
+        }
+    });
+
+    let challenge = make_challenge(&t, K_ALL, "test-nonce").unwrap();
+    let mut cheat_reader = TraceReader::open(&cheat_trace_path).unwrap();
+    let response = build_response(&mut cheat_reader, &challenge).unwrap();
+
+    // Per-element check alone would accept this cheat…
+    let loose = VerifyConfig {
+        tolerance: 0.05,
+        logits_tolerance: 0.05,
+        mean_tolerance: f32::INFINITY,
+    };
+    verify(&s.model_path, &t, &challenge, &response, &loose)
+        .expect("sub-tolerance drift must pass the per-element check (that is the point)");
+
+    // …the mean check rejects it.
+    let config = VerifyConfig {
+        tolerance: 0.05,
+        logits_tolerance: 0.05,
+        mean_tolerance: 0.01,
+    };
+    let err = verify(&s.model_path, &t, &challenge, &response, &config).unwrap_err();
+    assert!(
+        err.to_string().contains("mean deviation"),
         "unexpected error: {err}"
     );
 
@@ -194,6 +254,7 @@ fn tampered_response_and_model_are_rejected() {
     let config = VerifyConfig {
         tolerance: 0.05,
         logits_tolerance: 0.05,
+        mean_tolerance: 0.05,
     };
 
     // (a) Corrupt one revealed cell's payload: Merkle proof must reject.
