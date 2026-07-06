@@ -61,6 +61,9 @@ pub struct GenerateRequest {
     /// circuit-friendly hash, folded into the chain. Requires `trace_path`
     /// (salts and logits are stored in the trace file for later proving).
     pub zk_commit: Option<Box<ZkCommitFn>>,
+    /// Run the deterministic CPU backend (bit-exact re-execution; v0.2
+    /// challenges verify with tolerance zero). Slower; see det.rs.
+    pub deterministic: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -170,6 +173,119 @@ fn prepare_prompt(req: &GenerateRequest) -> Result<PromptSetup> {
     })
 }
 
+/// The engine's view of an inference backend: feed tokens, get logits and
+/// (optionally) the per-position commitment-hook states. Keeping the chain,
+/// trace, and zk logic in `generate` — single copy — means the transcript
+/// format cannot drift between the float and deterministic paths.
+trait InferBackend {
+    fn n_layers(&self) -> usize;
+    fn hidden_dim(&self) -> usize;
+    fn name(&self) -> &'static str;
+    /// Activation-cell fixed-point precision this backend commits at.
+    fn cell_frac_bits(&self, logit_frac_bits: u8) -> u8;
+    /// Feed `tokens` at absolute positions `index_pos..`; return the logits
+    /// of the last fed position and, when `capture`, the hook states as
+    /// hooks[pos_in_batch][hook 0..=n_layers] = Vec<f32> of hidden_dim.
+    #[allow(clippy::type_complexity)]
+    fn step(
+        &mut self,
+        tokens: &[u32],
+        index_pos: usize,
+        capture: bool,
+    ) -> Result<(Vec<f32>, Option<Vec<Vec<Vec<f32>>>>)>;
+}
+
+struct CandleBackend {
+    model: ModelWeights,
+    device: Device,
+    name: &'static str,
+}
+
+impl InferBackend for CandleBackend {
+    fn n_layers(&self) -> usize {
+        self.model.n_layers()
+    }
+
+    fn hidden_dim(&self) -> usize {
+        self.model.hidden_dim()
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn cell_frac_bits(&self, logit_frac_bits: u8) -> u8 {
+        logit_frac_bits
+    }
+
+    fn step(
+        &mut self,
+        tokens: &[u32],
+        index_pos: usize,
+        capture: bool,
+    ) -> Result<(Vec<f32>, Option<Vec<Vec<Vec<f32>>>>)> {
+        let input = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
+        let to_vec = |t: Tensor| -> Result<Vec<f32>> {
+            Ok(t.squeeze(0)?.to_dtype(candle_core::DType::F32)?.to_vec1()?)
+        };
+        if capture {
+            let mut layer_rows: Vec<Vec<Vec<f32>>> = Vec::new(); // [hook][pos]
+            let logits = self.model.forward_traced(&input, index_pos, &mut |_j, h| {
+                layer_rows.push(h.squeeze(0)?.to_dtype(candle_core::DType::F32)?.to_vec2()?);
+                Ok(())
+            })?;
+            let hooks = (0..tokens.len())
+                .map(|p| layer_rows.iter().map(|rows| rows[p].clone()).collect())
+                .collect();
+            Ok((to_vec(logits)?, Some(hooks)))
+        } else {
+            Ok((to_vec(self.model.forward(&input, index_pos)?)?, None))
+        }
+    }
+}
+
+struct DetBackend {
+    model: crate::det::DetModel,
+}
+
+impl InferBackend for DetBackend {
+    fn n_layers(&self) -> usize {
+        self.model.n_layers()
+    }
+
+    fn hidden_dim(&self) -> usize {
+        self.model.hidden_dim()
+    }
+
+    fn name(&self) -> &'static str {
+        crate::det::DET_BACKEND
+    }
+
+    fn cell_frac_bits(&self, _logit_frac_bits: u8) -> u8 {
+        self.model.act_frac_bits()
+    }
+
+    fn step(
+        &mut self,
+        tokens: &[u32],
+        index_pos: usize,
+        capture: bool,
+    ) -> Result<(Vec<f32>, Option<Vec<Vec<Vec<f32>>>>)> {
+        // Deterministic mode processes positions one at a time even for the
+        // prompt: there is no separate batch path to diverge from.
+        let mut hooks = capture.then(Vec::new);
+        let mut logits = Vec::new();
+        for (i, &token) in tokens.iter().enumerate() {
+            let (l, h) = self.model.step(token, index_pos + i, capture);
+            logits = l;
+            if let (Some(all), Some(h)) = (hooks.as_mut(), h) {
+                all.push(h);
+            }
+        }
+        Ok((logits, hooks))
+    }
+}
+
 /// Run generation, committing every decode step into the hash chain.
 /// `on_text` receives detokenized output incrementally (streaming).
 pub fn generate(
@@ -185,14 +301,24 @@ pub fn generate(
     if req.zk_commit.is_some() && req.trace_path.is_none() {
         bail!("--prove-decode requires --trace (salts and logits live in the trace file)");
     }
-    let (device, backend) = pick_device(req.force_cpu)?;
-
     let mut timing = Timing::default();
     let t0 = Instant::now();
-    let mut file = File::open(&req.model_path)
-        .with_context(|| format!("opening model {:?}", req.model_path))?;
-    let content = gguf_file::Content::read(&mut file)?;
-    let mut model = ModelWeights::from_gguf(content, &mut file, &device)?;
+    let mut backend: Box<dyn InferBackend> = if req.deterministic {
+        Box::new(DetBackend {
+            model: crate::det::DetModel::load(&req.model_path, req.logit_frac_bits)?,
+        })
+    } else {
+        let (device, name) = pick_device(req.force_cpu)?;
+        let mut file = File::open(&req.model_path)
+            .with_context(|| format!("opening model {:?}", req.model_path))?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let model = ModelWeights::from_gguf(content, &mut file, &device)?;
+        Box::new(CandleBackend {
+            model,
+            device,
+            name,
+        })
+    };
     timing.model_load = t0.elapsed();
 
     let mut chain = Chain::seed(&model_commitment.root, &prompt_ids, &req.sampler);
@@ -200,46 +326,33 @@ pub fn generate(
     let mut logits_processor =
         LogitsProcessor::from_sampling(req.sampler.rng_seed, sampling_for(&req.sampler));
 
-    let n_layers = model.n_layers();
+    let n_layers = backend.n_layers();
     let cells_per_pos = n_layers + 1;
+    let cell_frac_bits = backend.cell_frac_bits(req.logit_frac_bits);
     let mut tracer: Option<TraceBuilder> = req.trace_path.as_ref().map(|_| {
         TraceBuilder::new(
             n_layers as u32,
-            model.hidden_dim() as u32,
-            req.logit_frac_bits,
+            backend.hidden_dim() as u32,
+            cell_frac_bits,
             req.logit_frac_bits,
             prompt_ids.len() as u32 - 1,
         )
     });
 
-    // Prompt evaluation: one forward over the whole prompt; the returned
-    // logits (last position) are what the first generated token is sampled
-    // from, so they are committed as step 0.
+    // Prompt evaluation; the returned logits (last position) are what the
+    // first generated token is sampled from, so they are committed as
+    // step 0.
     let t0 = Instant::now();
-    let input = Tensor::new(prompt_ids.as_slice(), &device)?.unsqueeze(0)?;
-    let logits = if let Some(tb) = tracer.as_mut() {
-        // Capture the [1, P, dim] hidden states per layer, then reorder into
-        // position-major cell order.
-        let mut layer_rows: Vec<Vec<Vec<f32>>> = Vec::with_capacity(cells_per_pos);
-        let logits = model.forward_traced(&input, 0, &mut |_j, h| {
-            layer_rows.push(h.squeeze(0)?.to_dtype(candle_core::DType::F32)?.to_vec2()?);
-            Ok(())
-        })?;
+    let (mut logits_vec, prompt_hooks) = backend.step(&prompt_ids, 0, tracer.is_some())?;
+    if let (Some(tb), Some(hooks)) = (tracer.as_mut(), prompt_hooks) {
         let t_commit = Instant::now();
-        for pos in 0..prompt_ids.len() {
-            for rows in &layer_rows {
-                tb.push_cell(&rows[pos])?;
+        for per_pos in &hooks {
+            for h in per_pos {
+                tb.push_cell(h)?;
             }
         }
         timing.commit += t_commit.elapsed();
-        logits
-    } else {
-        model.forward(&input, 0)?
-    };
-    let mut logits_vec: Vec<f32> = logits
-        .squeeze(0)?
-        .to_dtype(candle_core::DType::F32)?
-        .to_vec1()?;
+    }
     timing.prompt_eval = t0.elapsed();
 
     // Fold the cell hashes of prompt positions 0..P-2 into the chain; the
@@ -328,32 +441,16 @@ pub fn generate(
             break;
         }
 
-        let input = Tensor::new(&[token_id], &device)?.unsqueeze(0)?;
         let index_pos = prompt_ids.len() + step;
-        let logits = if let Some(tb) = tracer.as_mut() {
-            let mut rows: Vec<Vec<f32>> = Vec::with_capacity(cells_per_pos);
-            let logits = model.forward_traced(&input, index_pos, &mut |_j, h| {
-                rows.push(
-                    h.squeeze(0)?
-                        .squeeze(0)?
-                        .to_dtype(candle_core::DType::F32)?
-                        .to_vec1()?,
-                );
-                Ok(())
-            })?;
+        let (l, hooks) = backend.step(&[token_id], index_pos, tracer.is_some())?;
+        logits_vec = l;
+        if let (Some(tb), Some(hooks)) = (tracer.as_mut(), hooks) {
             let t_commit = Instant::now();
-            for row in &rows {
-                tb.push_cell(row)?;
+            for h in &hooks[0] {
+                tb.push_cell(h)?;
             }
             timing.commit += t_commit.elapsed();
-            logits
-        } else {
-            model.forward(&input, index_pos)?
-        };
-        logits_vec = logits
-            .squeeze(0)?
-            .to_dtype(candle_core::DType::F32)?
-            .to_vec1()?;
+        }
     }
     timing.decode = t_decode.elapsed();
     timing.tokens_generated = generated.len();
@@ -392,7 +489,7 @@ pub fn generate(
         final_chain: chain.value(),
         text: (!text.is_empty()).then(|| text.clone()),
         env: EnvInfo {
-            backend: backend.into(),
+            backend: backend.name().into(),
             crate_version: env!("CARGO_PKG_VERSION").into(),
         },
     };

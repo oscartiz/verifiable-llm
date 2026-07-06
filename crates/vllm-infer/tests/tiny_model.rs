@@ -28,6 +28,7 @@ fn request(path: &Path, sampler: SamplerConfig) -> GenerateRequest {
         force_cpu: true,
         trace_path: None,
         zk_commit: None,
+        deterministic: false,
     }
 }
 
@@ -82,4 +83,45 @@ fn tiny_model_end_to_end() {
 
     std::fs::remove_file(path).ok();
     std::fs::remove_file(tampered_path).ok();
+}
+
+/// The deterministic backend: bit-identical across runs, close to the float
+/// path numerically, and traced at its own (coarser, roundtrip-exact) cell
+/// precision.
+#[test]
+fn deterministic_backend_is_deterministic_and_close_to_float() {
+    let bytes = tiny_llama_gguf();
+    let path = temp_model("det", &bytes);
+    let commitment = commit::commit_gguf(&path).unwrap();
+
+    let mut det_req = request(&path, SamplerConfig::greedy());
+    det_req.deterministic = true;
+    det_req.trace_path = Some(path.with_extension("det.trace"));
+    let a = generate(&det_req, &commitment, None).unwrap();
+
+    let mut det_req2 = request(&path, SamplerConfig::greedy());
+    det_req2.deterministic = true;
+    det_req2.trace_path = Some(path.with_extension("det2.trace"));
+    let b = generate(&det_req2, &commitment, None).unwrap();
+
+    // Bit-identical: same final chain (covers every cell hash, every logit).
+    assert_eq!(a.transcript.final_chain, b.transcript.final_chain);
+    assert_eq!(a.transcript.env.backend, "det-cpu-v1");
+    assert_eq!(a.transcript.trace.as_ref().unwrap().frac_bits, 8);
+    assert_eq!(a.transcript.replay_chain(), ChainCheck::Ok);
+    a.transcript.check_trace_binding().unwrap();
+
+    // Numerically close to the float path (requantization at 2^-8 hooks
+    // perturbs mildly; the tiny model's logits are O(1)).
+    let float = generate(&request(&path, SamplerConfig::greedy()), &commitment, None).unwrap();
+    // Compare step-0 committed logit hashes indirectly via token choice and
+    // magnitude: the first greedy token should agree.
+    assert_eq!(
+        a.transcript.steps[0].token_id, float.transcript.steps[0].token_id,
+        "det and float paths disagree on the very first greedy token"
+    );
+
+    std::fs::remove_file(path.with_extension("det.trace")).ok();
+    std::fs::remove_file(path.with_extension("det2.trace")).ok();
+    std::fs::remove_file(path).ok();
 }

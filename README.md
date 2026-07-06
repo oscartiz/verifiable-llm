@@ -76,6 +76,13 @@ vllm respond   --commitment run.json --trace run.trace \
 vllm verify    --commitment run.json --model $MODEL \
     --challenge challenge.json --response response.json
 
+# --- v0.4: deterministic mode - challenges verify with EXACT equality ---
+vllm generate --model $MODEL --tokenizer $TOK --prompt "..." \
+    --greedy --max-tokens 100 --deterministic --commit run.json --trace run.trace
+# ... then challenge/respond as usual; verify requires zero deviation:
+vllm verify --commitment run.json --model $MODEL \
+    --challenge challenge.json --response response.json   # max |delta| must be 0
+
 # --- v0.3: prove the decode step (greedy transcripts; add --prove-decode) ---
 vllm generate --model $MODEL --tokenizer $TOK --prompt "..." \
     --greedy --max-tokens 100 --commit run.json --trace run.trace --prove-decode
@@ -154,17 +161,20 @@ verifier passes `--nonce <fresh randomness>` chosen *after* receiving the
 transcript, which removes the prover's ability to grind entirely. The
 empty-nonce mode remains useful for self-audit and archival transcripts.
 
-**What v0.2 does not close.** Re-execution is tolerance-based (float drift
-across backends, measured max ≈ 5e-2 per block CPU↔Metal on the 1B model,
-default tolerance 0.5). An adversary may therefore inject perturbations
-below the tolerance at every cell. **REPORT.md quantifies this attack on
-the real model**: the network amplifies sub-tolerance drift ~30–80×, and
-token steering is feasible even at τ = 0.01. The verifier therefore also
-enforces a per-cell *mean* deviation bound (`--mean-tolerance`, default
-0.05 vs measured honest ≤ 8e-3), which caps the adversary's average budget
-~10× but does not eliminate steering. The guarantee Layer 2 delivers is
-*drift-bounded computation with the committed weights* — exact token
-provenance needs deterministic (integer-only) inference, the natural v0.4.
+**Float transcripts are tolerance-verified; deterministic transcripts are
+exact.** For the default Metal backend, re-execution is tolerance-based
+(float drift across backends, measured max ≈ 5e-2 per block CPU↔Metal on
+the 1B model, default tolerance 0.5). An adversary may therefore inject
+perturbations below the tolerance at every cell. **REPORT.md quantifies
+this attack**: the network amplifies sub-tolerance drift ~30–80×, and token
+steering is feasible even at τ = 0.01. Two mitigations ship: a per-cell
+*mean* deviation bound (`--mean-tolerance`, default 0.05 vs measured honest
+≤ 8e-3) that caps the adversary's average budget ~10×, and — the actual fix
+— **`--deterministic` (v0.4)**: a fixed-evaluation-order CPU backend whose
+transcripts verify with *zero tolerance* (i32 cell equality). Under exact
+verification a single-quantum perturbation (2⁻⁸ on one element) is caught,
+closing the bounded-drift attack entirely; the trade is speed (~10 tok/s
+vs ~80 on Metal for the 1B model). See DECISIONS.md #16.
 
 ## The decode proof (v0.3)
 
@@ -225,8 +235,9 @@ writer) and runs the full commit → generate → replay → tamper cycle on CPU
 - The llama3 chat template is hardcoded; `--raw` bypasses it.
 - Tracing costs ~7 % of inference time (per-layer GPU→CPU transfers) and
   ~0.5 MB of trace per position for the 1B model; it is opt-in.
-- v0.2 verification is tolerance-based; see the protocol section for the
-  bounded-drift caveat.
+- Float (Metal) transcripts are tolerance-verified — see the protocol
+  section for the bounded-drift caveat; `--deterministic` transcripts
+  verify exactly at ~8x lower generation speed and ~5 GB extra RAM.
 - v0.3 proves argmax (greedy) only, and is a succinct argument rather than
   formal ZK — see the decode-proof section for the exact statement.
 - `--prove-decode` costs ~45 ms/token (native Rescue sponge over the 128k

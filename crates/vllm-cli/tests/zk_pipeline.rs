@@ -36,6 +36,7 @@ fn zk_commit_prove_verify_pipeline() {
             let digest = vllm_zk::commit_logits(q, salt).map_err(|e| e.to_string())?;
             Ok(ZkCommitment { salt, digest })
         })),
+        deterministic: false,
     };
     let out = generate(&req, &commitment, None).unwrap();
     let t = out.transcript;

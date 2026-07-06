@@ -41,6 +41,7 @@ fn honest_run(tag: &str) -> Setup {
         force_cpu: true,
         trace_path: Some(trace_path.clone()),
         zk_commit: None,
+        deterministic: false,
     };
     let out = generate(&req, &commitment, None).unwrap();
     assert_eq!(out.transcript.replay_chain(), ChainCheck::Ok);
@@ -338,6 +339,7 @@ fn respond_rejects_forged_challenges_and_wrong_trace() {
         force_cpu: true,
         trace_path: Some(other_trace.clone()),
         zk_commit: None,
+        deterministic: false,
     };
     generate(&req, &commitment, None).unwrap();
     let mut other_reader = TraceReader::open(&other_trace).unwrap();
@@ -346,5 +348,73 @@ fn respond_rejects_forged_challenges_and_wrong_trace() {
     std::fs::remove_file(&model_path).ok();
     std::fs::remove_file(&other_trace).ok();
     cleanup(&s2);
+    cleanup(&s);
+}
+
+fn honest_run_det(tag: &str) -> Setup {
+    let model_path = temp_path(&format!("{tag}-model"), "gguf");
+    std::fs::write(&model_path, tiny_llama_gguf()).unwrap();
+    let trace_path = temp_path(&format!("{tag}-trace"), "trace");
+    let commitment = commit::commit_gguf(&model_path).unwrap();
+    let req = GenerateRequest {
+        model_path: model_path.clone(),
+        tokenizer_path: None,
+        prompt: Prompt::Tokens(PROMPT.to_vec()),
+        raw: true,
+        max_new_tokens: STEPS,
+        sampler: SamplerConfig::greedy(),
+        logit_frac_bits: 16,
+        force_cpu: true,
+        trace_path: Some(trace_path.clone()),
+        zk_commit: None,
+        deterministic: true,
+    };
+    let out = generate(&req, &commitment, None).unwrap();
+    assert_eq!(out.transcript.env.backend, "det-cpu-v1");
+    assert_eq!(out.transcript.replay_chain(), ChainCheck::Ok);
+    out.transcript.check_trace_binding().unwrap();
+    Setup {
+        model_path,
+        trace_path,
+        transcript: out.transcript,
+    }
+}
+
+/// Deterministic transcripts verify with EXACT equality: honest runs show
+/// zero deviation, and a single-quantum perturbation — 2^-8 on ONE element
+/// of one cell, with every hash rebuilt honestly — is caught. This is the
+/// bounded-drift gap (REPORT.md) closed.
+#[test]
+fn deterministic_verification_is_exact() {
+    let s = honest_run_det("det");
+    let challenge = make_challenge(&s.transcript, K_ALL, "det-nonce").unwrap();
+    let mut reader = TraceReader::open(&s.trace_path).unwrap();
+    let response = build_response(&mut reader, &challenge).unwrap();
+
+    // Honest: every challenge passes with literally zero deviation.
+    let config = VerifyConfig::default();
+    let report = verify(&s.model_path, &s.transcript, &challenge, &response, &config).unwrap();
+    assert_eq!(report.items.len(), 28);
+    assert_eq!(report.max_dev, 0.0, "honest det verification must be exact");
+
+    // Cheat: one quantum (2^-8) on one element of an output-only cell —
+    // undetectable at ANY float tolerance, caught by exact verification.
+    let (cheat_trace_path, t) = rebuild_cheating(&s, "det-rebuilt", |pos, layer, values| {
+        if pos == 1 && layer == LAYERS {
+            values[0] += 1.0 / 256.0;
+        }
+    });
+    assert_eq!(t.env.backend, "det-cpu-v1");
+    let challenge = make_challenge(&t, K_ALL, "det-nonce").unwrap();
+    let mut cheat_reader = TraceReader::open(&cheat_trace_path).unwrap();
+    let response = build_response(&mut cheat_reader, &challenge).unwrap();
+    let err = verify(&s.model_path, &t, &challenge, &response, &config).unwrap_err();
+    assert!(
+        err.to_string().contains("EXACT verification failed"),
+        "got: {err}"
+    );
+    assert!(err.to_string().contains("1 quanta"), "got: {err}");
+
+    std::fs::remove_file(&cheat_trace_path).ok();
     cleanup(&s);
 }

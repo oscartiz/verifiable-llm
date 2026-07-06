@@ -201,3 +201,42 @@ default (`--mean-tolerance`; ~6x headroom over honest). Tested: a uniform
 mean check. Stated plainly in REPORT.md: this narrows the attack ~10x, it
 does not close it — exact token integrity requires deterministic integer
 inference (roadmap v0.4).
+
+## 16. Deterministic backend: fixed-order float, not integer-only
+
+REPORT.md's conclusion called for "deterministic (integer-only) inference";
+building it clarified that integer arithmetic was the means, not the
+requirement. Bit-exact re-execution needs exactly three things, delivered
+by `vllm-infer/src/det.rs` + `det_math.rs`:
+
+1. **Fixed evaluation order.** IEEE-754 f32/f64 basic ops are exactly
+   specified; nondeterminism comes from SIMD/blocked reductions
+   reassociating sums and from thread-order-dependent accumulation. The det
+   kernels are sequential scalar loops; rayon parallelism only ever spans
+   independent outputs. (Integer accumulation would buy order-independence
+   — unnecessary once the order is pinned. Full model quality is retained;
+   integer-only would have required I-BERT-style approximations of
+   softmax/rmsnorm/silu.)
+2. **No libm.** exp/sin/cos vary across platforms; det_math pins them with
+   fixed-order polynomial implementations (~1e-13 relative accuracy).
+3. **Hook requantization.** The hidden state is snapped to the trace grid
+   at every commitment hook, so the committed cell IS the computation
+   state, and the verifier's recomputation from committed inputs is
+   bit-identical. Activation cells use 2^-8, not 2^-16: quantize∘dequantize
+   must be idempotent for exactness, and beyond |x| = 128 the f32 grid is
+   coarser than 2^-16 (llama outlier channels exceed 128). At 2^-8 the
+   roundtrip is exact up to |x| = 32768. Logits stay at 2^-16 (|logit|<50).
+
+Also pinned: prompt processed position-at-a-time (no separate batch path to
+diverge from), weights dequantized upfront via candle's scalar CPU kernels
+(per-element, no reductions — order-independent; ~5 GB resident for 1B),
+transcripts tagged `det-cpu-v1` (bump on ANY computational change).
+
+Measured (Llama-3.2-1B Q4_K_M, M-series): 10.2 tok/s decode (vs ~80 on
+Metal), load 2.2 s, reruns bit-identical (equal final chains). Verification
+of det transcripts is EXACT: recompute → quantize → i32 equality, zero
+tolerance; 20 real-model challenges verified with 0 deviation in 4.9 s.
+Tested: a fully self-consistent cheat that shifts ONE element of one cell
+by ONE quantum (2^-8) — invisible at any float tolerance — is caught. This
+closes REPORT.md's bounded-drift attack for deterministic transcripts and
+makes them portable across machines/platforms (same binary version).

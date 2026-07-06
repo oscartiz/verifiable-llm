@@ -158,6 +158,10 @@ struct GenerateArgs {
     /// --trace.
     #[arg(long, requires = "trace")]
     prove_decode: bool,
+    /// Deterministic CPU backend: bit-exact re-execution, so challenges
+    /// verify with tolerance zero. Slower than Metal; ~5 GB extra RAM.
+    #[arg(long)]
+    deterministic: bool,
 }
 
 fn main() -> Result<()> {
@@ -400,6 +404,7 @@ fn cmd_generate(args: GenerateArgs) -> Result<()> {
         logit_frac_bits: args.frac_bits,
         force_cpu: args.cpu,
         trace_path: args.trace.clone(),
+        deterministic: args.deterministic,
         zk_commit: args.prove_decode.then(|| {
             Box::new(|q: &[i32]| {
                 let salt = vllm_zk::random_salt();

@@ -96,13 +96,13 @@ approximation):
    attack's operating room by ~10× but does **not** eliminate it — stated
    here so nobody mistakes it for a fix.
 
-4. **The actual fix is determinism, not tighter tolerances**: exact
-   re-execution (tolerance zero) requires integer-only inference kernels so
-   that prover and verifier compute bit-identical activations. With exact
-   matching, any perturbation — however small — breaks a challenged cell.
-   That is the natural v0.4: a deterministic quantized inference path,
-   which would also make transcripts portable across backends. Until then,
-   parties who need exact token integrity should verify on the same
-   backend with `--tolerance` and `--mean-tolerance` set to the measured
-   same-backend noise floor (~1e-3), which reduces — but per Result 3 does
-   not fully close — the steering margin.
+4. **The actual fix is determinism, not tighter tolerances** — and it
+   shipped as v0.4: `--deterministic` runs a fixed-evaluation-order CPU
+   backend (DECISIONS.md #16) whose challenges verify with *zero*
+   tolerance (i32 cell equality). Under exact verification, any
+   perturbation — a single 2⁻⁸ quantum on one element — breaks a
+   challenged cell (tested). Measured on the 1B model: 10.2 tok/s
+   generation, 20/20 real-model challenges verified with 0 deviation.
+   The attacks in this report remain relevant to the fast float path;
+   parties who need exact token provenance should generate with
+   `--deterministic`.

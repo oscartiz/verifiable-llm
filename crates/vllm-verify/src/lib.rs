@@ -28,8 +28,9 @@ use vllm_core::commit;
 use vllm_core::protocol::{
     Challenge, ChallengeSpace, Response, b64_decode_i32, check_revealed_cell, derive_challenges,
 };
-use vllm_core::trace::{TraceMeta, dequantize};
+use vllm_core::trace::{TraceMeta, dequantize, quantize};
 use vllm_core::transcript::{ChainCheck, Transcript};
+use vllm_infer::det::{DET_BACKEND, DetModel};
 use vllm_infer::model::ModelWeights;
 
 /// Default max |Δ| per activation element when re-executing a block on CPU
@@ -172,16 +173,36 @@ pub fn verify(
         );
     }
 
-    // 4-7. Load the model on CPU and check every item.
-    let device = Device::Cpu;
-    let mut file = File::open(model_path)?;
-    let content = gguf_file::Content::read(&mut file)?;
-    let mut model = ModelWeights::from_gguf(content, &mut file, &device)?;
-    if model.n_layers() as u32 != meta.n_layers || model.hidden_dim() as u32 != meta.hidden_dim {
+    // 4-7. Load the model on CPU and check every item. Deterministic
+    // transcripts get EXACT verification (tolerance zero, i32 equality);
+    // float transcripts get tolerance-based verification.
+    let exact = transcript.env.backend == DET_BACKEND;
+    let mut det_model = None;
+    let mut float_model = None;
+    let (n_layers, hidden_dim) = if exact {
+        let m = DetModel::load(model_path, transcript.logit_frac_bits)?;
+        if m.act_frac_bits() != meta.frac_bits {
+            bail!(
+                "deterministic transcript committed at 2^-{} but this det backend uses 2^-{}",
+                meta.frac_bits,
+                m.act_frac_bits()
+            );
+        }
+        let dims = (m.n_layers(), m.hidden_dim());
+        det_model = Some(m);
+        dims
+    } else {
+        let device = Device::Cpu;
+        let mut file = File::open(model_path)?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let m = ModelWeights::from_gguf(content, &mut file, &device)?;
+        let dims = (m.n_layers(), m.hidden_dim());
+        float_model = Some(m);
+        dims
+    };
+    if n_layers as u32 != meta.n_layers || hidden_dim as u32 != meta.hidden_dim {
         bail!(
-            "model shape ({} layers, dim {}) does not match trace ({}, {})",
-            model.n_layers(),
-            model.hidden_dim(),
+            "model shape ({n_layers} layers, dim {hidden_dim}) does not match trace ({}, {})",
             meta.n_layers,
             meta.hidden_dim
         );
@@ -198,10 +219,23 @@ pub fn verify(
                 cell.layer
             );
         }
-        let (dev, mean) = if cell.layer < meta.n_layers {
-            verify_block(&mut model, transcript, &meta, item, config, &device)?
-        } else {
-            verify_head(&model, transcript, &meta, item, config, &device)?
+        let (dev, mean) = match (&mut det_model, &mut float_model) {
+            (Some(m), _) => {
+                if cell.layer < meta.n_layers {
+                    verify_block_det(m, transcript, &meta, item)?
+                } else {
+                    verify_head_det(m, transcript, &meta, item)?
+                }
+            }
+            (None, Some(m)) => {
+                let device = Device::Cpu;
+                if cell.layer < meta.n_layers {
+                    verify_block(m, transcript, &meta, item, config, &device)?
+                } else {
+                    verify_head(m, transcript, &meta, item, config, &device)?
+                }
+            }
+            _ => unreachable!(),
         };
         max_dev = max_dev.max(dev);
         max_mean_dev = max_mean_dev.max(mean);
@@ -409,4 +443,143 @@ fn verify_head(
         );
     }
     Ok((dev, mean))
+}
+
+/// Exact block check for deterministic transcripts: recompute block `j`
+/// over the dequantized committed inputs, requantize, and require i32
+/// equality with the committed output cell. Any nonzero difference —
+/// a single quantum — is a cheat.
+fn verify_block_det(
+    model: &DetModel,
+    transcript: &Transcript,
+    meta: &TraceMeta,
+    item: &vllm_core::protocol::ResponseItem,
+) -> Result<(f32, f32)> {
+    let cell = item.cell;
+    let seq = cell.pos as usize + 1;
+    if item.inputs.len() != seq {
+        bail!(
+            "challenge ({}, {}): expected {seq} input cells, got {}",
+            cell.pos,
+            cell.layer,
+            item.inputs.len()
+        );
+    }
+    let mut prefix = Vec::with_capacity(seq);
+    for (p, revealed) in item.inputs.iter().enumerate() {
+        if revealed.pos != p as u32 || revealed.layer != cell.layer {
+            bail!(
+                "challenge ({}, {}): input cell at wrong coordinates",
+                cell.pos,
+                cell.layer
+            );
+        }
+        let data = check_revealed_cell(revealed, meta, &meta.root)?;
+        prefix.push(dequantize(&data, meta.frac_bits));
+    }
+    let output = item.output.as_ref().with_context(|| {
+        format!(
+            "challenge ({}, {}): missing output cell",
+            cell.pos, cell.layer
+        )
+    })?;
+    if output.pos != cell.pos || output.layer != cell.layer + 1 {
+        bail!(
+            "challenge ({}, {}): output cell at wrong coordinates",
+            cell.pos,
+            cell.layer
+        );
+    }
+    let committed_q = check_revealed_cell(output, meta, &meta.root)?;
+
+    // Layer-0 inputs must BE the committed tokens' embeddings, exactly.
+    if cell.layer == 0 {
+        for (p, x) in prefix.iter().enumerate() {
+            let expected = model.embed_row(token_at(transcript, p as u32)?);
+            if &expected != x {
+                bail!(
+                    "challenge ({}, 0): layer-0 input at position {p} is not the token embedding",
+                    cell.pos
+                );
+            }
+        }
+    }
+
+    let recomputed = model.forward_block(cell.layer as usize, &prefix);
+    let recomputed_q = quantize(&recomputed, meta.frac_bits)
+        .map_err(|e| anyhow::anyhow!("recomputed activations unquantizable: {e}"))?;
+    exact_compare(&recomputed_q, &committed_q, cell.pos, cell.layer)
+}
+
+/// Exact head check: recomputed logits must equal the revealed (chain-bound)
+/// quantized logits, i32 for i32.
+fn verify_head_det(
+    model: &DetModel,
+    transcript: &Transcript,
+    meta: &TraceMeta,
+    item: &vllm_core::protocol::ResponseItem,
+) -> Result<(f32, f32)> {
+    let cell = item.cell;
+    let step = (cell.pos - meta.first_logit_pos) as usize;
+    let record = transcript
+        .steps
+        .get(step)
+        .with_context(|| format!("head challenge at pos {} has no step", cell.pos))?;
+    let [input] = item.inputs.as_slice() else {
+        bail!(
+            "head challenge at pos {}: expected exactly one input cell",
+            cell.pos
+        );
+    };
+    if input.pos != cell.pos || input.layer != meta.n_layers {
+        bail!(
+            "head challenge at pos {}: input cell at wrong coordinates",
+            cell.pos
+        );
+    }
+    let hidden = dequantize(
+        &check_revealed_cell(input, meta, &meta.root)?,
+        meta.frac_bits,
+    );
+    let logits_b64 = item
+        .logits
+        .as_ref()
+        .with_context(|| format!("head challenge at pos {}: missing logits", cell.pos))?;
+    let revealed_q = b64_decode_i32(logits_b64)
+        .with_context(|| format!("head challenge at pos {}: bad logits encoding", cell.pos))?;
+    if hash_logits_q(&revealed_q, transcript.logit_frac_bits) != record.logits_hash {
+        bail!(
+            "head challenge at pos {}: revealed logits do not hash to the committed logits_hash",
+            cell.pos
+        );
+    }
+    let recomputed = model.lm_head(&hidden);
+    let recomputed_q = quantize(&recomputed, transcript.logit_frac_bits)
+        .map_err(|e| anyhow::anyhow!("recomputed logits unquantizable: {e}"))?;
+    exact_compare(&recomputed_q, &revealed_q, cell.pos, cell.layer)
+}
+
+/// i32-exact comparison; reports the max quantum difference on failure.
+fn exact_compare(
+    recomputed: &[i32],
+    committed: &[i32],
+    pos: u32,
+    layer: u32,
+) -> Result<(f32, f32)> {
+    if recomputed.len() != committed.len() {
+        bail!("challenge ({pos}, {layer}): dimension mismatch");
+    }
+    let max_dq = recomputed
+        .iter()
+        .zip(committed)
+        .map(|(a, b)| (*a as i64 - *b as i64).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    if max_dq != 0 {
+        bail!(
+            "challenge ({pos}, {layer}): EXACT verification failed — recomputation differs from \
+             the committed cell by up to {max_dq} quanta (deterministic transcripts admit zero)"
+        );
+    }
+    Ok((0.0, 0.0))
 }
