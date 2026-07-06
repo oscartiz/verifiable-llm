@@ -1,5 +1,8 @@
 # verifiable-llm
 
+[![ci](https://github.com/oscartiz/verifiable-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/oscartiz/verifiable-llm/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Verifiable local LLM inference on Apple Silicon: run a quantized llama GGUF
 with [candle] and produce cryptographic commitments to *which model* ran and
 *what it computed*, so a third party can check the claim later.
