@@ -1,0 +1,24 @@
+[package]
+name = "vllm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for verifiable local LLM inference"
+
+[[bin]]
+name = "vllm"
+path = "src/main.rs"
+
+[dependencies]
+vllm-core = { workspace = true }
+vllm-infer = { workspace = true }
+vllm-verify = { workspace = true }
+vllm-zk = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = ["metal"]
+metal = ["vllm-infer/metal"]

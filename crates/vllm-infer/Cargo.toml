@@ -1,0 +1,17 @@
+[package]
+name = "vllm-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Candle-based quantized llama inference with commitment hooks"
+
+[dependencies]
+vllm-core = { workspace = true }
+anyhow = { workspace = true }
+candle-core = { workspace = true }
+candle-transformers = { workspace = true }
+tokenizers = { workspace = true }
+candle-nn = { workspace = true }
+
+[features]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]

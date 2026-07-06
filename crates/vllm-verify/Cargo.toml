@@ -1,0 +1,12 @@
+[package]
+name = "vllm-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU verifier for the vllm spot-check challenge protocol"
+
+[dependencies]
+vllm-core = { workspace = true }
+vllm-infer = { workspace = true }
+anyhow = { workspace = true }
+candle-core = { workspace = true }
