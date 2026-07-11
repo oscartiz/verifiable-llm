@@ -3,12 +3,36 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use vllm_core::chain::{SamplerConfig, SamplerMode};
 use vllm_core::commit::{self, ModelCommitment, VerifyOutcome};
 use vllm_core::transcript::{ChainCheck, Transcript};
 use vllm_infer::engine::{self, GenerateRequest, Prompt};
+
+/// Which Layer-3 proof system commits the logits and proves the decode step.
+/// Both prove the same argmax statement; the salted 32-byte digest each
+/// produces is folded into the chain identically, so the transcript/trace
+/// format is backend-agnostic (see DECISIONS.md #17).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum ZkBackend {
+    /// winterfell STARK: fast, succinct, but not formally zero-knowledge.
+    #[default]
+    Winterfell,
+    /// halo2 (transparent IPA): formally zero-knowledge, slower. Requires the
+    /// `zk-halo2` build feature.
+    Halo2,
+}
+
+impl ZkBackend {
+    /// The tag written into (and matched from) the decode-proof envelope.
+    fn tag(self) -> &'static str {
+        match self {
+            ZkBackend::Winterfell => "winterfell",
+            ZkBackend::Halo2 => "halo2",
+        }
+    }
+}
 
 /// Verifiable local LLM inference.
 #[derive(Parser)]
@@ -69,8 +93,8 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Produce a STARK proof that a generated token is the argmax of its
-    /// committed logit vector (transcript must be greedy + --prove-decode).
+    /// Produce a proof that a generated token is the argmax of its committed
+    /// logit vector (transcript must be greedy + --prove-decode).
     ProveDecode {
         #[arg(long)]
         commitment: PathBuf,
@@ -81,9 +105,13 @@ enum Command {
         step: u32,
         #[arg(long)]
         out: PathBuf,
+        /// Proof system; must match the one used at generation. `halo2` needs
+        /// the `zk-halo2` build feature.
+        #[arg(long, value_enum, default_value_t = ZkBackend::Winterfell)]
+        backend: ZkBackend,
     },
     /// Verify an argmax decode proof against a transcript (no model, no
-    /// trace, no GPU needed).
+    /// trace, no GPU needed). The proof system is read from the proof file.
     VerifyDecode {
         #[arg(long)]
         commitment: PathBuf,
@@ -153,11 +181,15 @@ struct GenerateArgs {
     /// Write an activation trace file (required to answer v0.2 challenges).
     #[arg(long)]
     trace: Option<PathBuf>,
-    /// Commit each step's logits with a salted Rescue-Prime digest so the
+    /// Commit each step's logits with a salted, circuit-friendly digest so the
     /// decode step can later be proved with `vllm prove-decode`. Requires
     /// --trace.
     #[arg(long, requires = "trace")]
     prove_decode: bool,
+    /// Proof system for the decode commitment (with --prove-decode). `halo2`
+    /// is formally zero-knowledge but needs the `zk-halo2` build feature.
+    #[arg(long, value_enum, default_value_t = ZkBackend::Winterfell)]
+    zk_backend: ZkBackend,
     /// Deterministic CPU backend: bit-exact re-execution, so challenges
     /// verify with tolerance zero. Slower than Metal; ~5 GB extra RAM.
     #[arg(long)]
@@ -175,7 +207,8 @@ fn main() -> Result<()> {
             trace,
             step,
             out,
-        } => cmd_prove_decode(&commitment, &trace, step, &out),
+            backend,
+        } => cmd_prove_decode(&commitment, &trace, step, &out, backend),
         Command::VerifyDecode { commitment, proof } => cmd_verify_decode(&commitment, &proof),
         Command::Challenge {
             commitment,
@@ -394,6 +427,7 @@ fn cmd_generate(args: GenerateArgs) -> Result<()> {
         }
     };
 
+    let zk_commit = build_zk_commit(args.prove_decode, args.zk_backend)?;
     let req = GenerateRequest {
         model_path: args.model.clone(),
         tokenizer_path: tokenizer,
@@ -405,13 +439,7 @@ fn cmd_generate(args: GenerateArgs) -> Result<()> {
         force_cpu: args.cpu,
         trace_path: args.trace.clone(),
         deterministic: args.deterministic,
-        zk_commit: args.prove_decode.then(|| {
-            Box::new(|q: &[i32]| {
-                let salt = vllm_zk::random_salt();
-                let digest = vllm_zk::commit_logits(q, salt).map_err(|e| e.to_string())?;
-                Ok(vllm_infer::engine::ZkCommitment { salt, digest })
-            }) as Box<vllm_infer::engine::ZkCommitFn>
-        }),
+        zk_commit,
     };
 
     let mut stdout = std::io::stdout();
@@ -474,19 +502,61 @@ fn cmd_replay(path: &Path) -> Result<()> {
     }
 }
 
+fn default_backend_tag() -> String {
+    ZkBackend::Winterfell.tag().into()
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DecodeProof {
     version: String,
+    /// Proof system: "winterfell" (default, for pre-v0.5 proofs) or "halo2".
+    #[serde(default = "default_backend_tag")]
+    backend: String,
     step: u32,
     token_id: u32,
     vocab_size: u32,
-    /// Rescue-Prime logits commitment (must equal the step's zk_digest).
+    /// Circuit-friendly logits commitment (must equal the step's zk_digest).
     digest: String,
-    /// Base64 winterfell proof.
+    /// Base64-encoded proof bytes.
     proof: String,
 }
 
-fn cmd_prove_decode(commitment: &Path, trace: &Path, step: u32, out: &Path) -> Result<()> {
+/// The generation hook that commits a step's logits, per backend.
+fn build_zk_commit(
+    prove_decode: bool,
+    backend: ZkBackend,
+) -> Result<Option<Box<vllm_infer::engine::ZkCommitFn>>> {
+    use vllm_infer::engine::{ZkCommitFn, ZkCommitment};
+    if !prove_decode {
+        return Ok(None);
+    }
+    let f: Box<ZkCommitFn> = match backend {
+        ZkBackend::Winterfell => Box::new(|q: &[i32]| {
+            let salt = vllm_zk::random_salt();
+            let digest = vllm_zk::commit_logits(q, salt).map_err(|e| e.to_string())?;
+            Ok(ZkCommitment { salt, digest })
+        }),
+        ZkBackend::Halo2 => {
+            #[cfg(feature = "zk-halo2")]
+            {
+                Box::new(halo2_backend::zk_commit)
+            }
+            #[cfg(not(feature = "zk-halo2"))]
+            {
+                bail!("the halo2 backend requires building with --features zk-halo2");
+            }
+        }
+    };
+    Ok(Some(f))
+}
+
+fn cmd_prove_decode(
+    commitment: &Path,
+    trace: &Path,
+    step: u32,
+    out: &Path,
+    backend: ZkBackend,
+) -> Result<()> {
     let transcript: Transcript = read_json(commitment)?;
     if transcript.replay_chain() != ChainCheck::Ok {
         bail!("transcript chain does not replay");
@@ -511,16 +581,28 @@ fn cmd_prove_decode(commitment: &Path, trace: &Path, step: u32, out: &Path) -> R
     let salt = *salts.get(step as usize).context("no salt for step")?;
     let logits = reader.logits_row(step)?;
 
-    // The trace's logits must match the chain-bound commitment before proving.
-    let digest = vllm_zk::commit_logits(&logits, salt)?;
-    if digest != zk_digest.0 {
-        bail!("trace logits do not match the step's zk commitment");
-    }
-
+    // Recompute the digest under the selected backend; it must match the
+    // chain-bound commitment (also rejects a backend/transcript mismatch),
+    // then prove.
     let t0 = Instant::now();
-    let proof = vllm_zk::prove_argmax(&logits, salt, record.token_id)?;
+    let (proof, version) = match backend {
+        ZkBackend::Winterfell => {
+            if vllm_zk::commit_logits(&logits, salt)? != zk_digest.0 {
+                bail!("trace logits do not match the step's zk commitment (wrong --backend?)");
+            }
+            (
+                vllm_zk::prove_argmax(&logits, salt, record.token_id)?,
+                "vllm/zk-proof/v1",
+            )
+        }
+        ZkBackend::Halo2 => (
+            halo2_prove(&logits, salt, record.token_id, &zk_digest.0)?,
+            "vllm/zk-proof-halo2/v1",
+        ),
+    };
     let envelope = DecodeProof {
-        version: "vllm/zk-proof/v1".into(),
+        version: version.into(),
+        backend: backend.tag().into(),
         step,
         token_id: record.token_id,
         vocab_size: transcript.vocab_size,
@@ -529,7 +611,8 @@ fn cmd_prove_decode(commitment: &Path, trace: &Path, step: u32, out: &Path) -> R
     };
     std::fs::write(out, serde_json::to_string_pretty(&envelope)?)?;
     eprintln!(
-        "proved argmax for step {step} (token {}) in {:.2?}; {} KB -> {}",
+        "proved argmax ({}) for step {step} (token {}) in {:.2?}; {} KB -> {}",
+        backend.tag(),
         record.token_id,
         t0.elapsed(),
         proof.len() / 1024,
@@ -541,6 +624,11 @@ fn cmd_prove_decode(commitment: &Path, trace: &Path, step: u32, out: &Path) -> R
 fn cmd_verify_decode(commitment: &Path, proof_path: &Path) -> Result<()> {
     let transcript: Transcript = read_json(commitment)?;
     let envelope: DecodeProof = read_json(proof_path)?;
+    let backend = match envelope.backend.as_str() {
+        "winterfell" => ZkBackend::Winterfell,
+        "halo2" => ZkBackend::Halo2,
+        other => bail!("unknown decode-proof backend {other:?}"),
+    };
     if transcript.replay_chain() != ChainCheck::Ok {
         bail!("transcript chain does not replay");
     }
@@ -561,17 +649,104 @@ fn cmd_verify_decode(commitment: &Path, proof_path: &Path) -> Result<()> {
     let proof_bytes =
         vllm_core::protocol::b64_decode(&envelope.proof).context("bad proof encoding")?;
     let t0 = Instant::now();
-    vllm_zk::verify_argmax(
-        &zk_digest.0,
-        record.token_id,
-        transcript.vocab_size,
-        &proof_bytes,
-    )?;
+    match backend {
+        ZkBackend::Winterfell => vllm_zk::verify_argmax(
+            &zk_digest.0,
+            record.token_id,
+            transcript.vocab_size,
+            &proof_bytes,
+        )?,
+        ZkBackend::Halo2 => halo2_verify(
+            &zk_digest.0,
+            record.token_id,
+            transcript.vocab_size,
+            &proof_bytes,
+        )?,
+    }
     eprintln!(
-        "OK: step {} emitted token {} = argmax of the committed logits ({:.2?})",
+        "OK ({}): step {} emitted token {} = argmax of the committed logits ({:.2?})",
+        backend.tag(),
         envelope.step,
         record.token_id,
         t0.elapsed()
     );
     Ok(())
+}
+
+// ---- halo2 formal-ZK backend (optional; heavy proof-system deps) ----
+
+#[cfg(feature = "zk-halo2")]
+fn halo2_prove(logits: &[i32], salt: [u64; 4], token: u32, expected: &[u8; 32]) -> Result<Vec<u8>> {
+    if &halo2_backend::commit(logits, salt)? != expected {
+        bail!("trace logits do not match the step's zk commitment (wrong --backend?)");
+    }
+    halo2_backend::prove(logits, salt, token)
+}
+
+#[cfg(not(feature = "zk-halo2"))]
+fn halo2_prove(_: &[i32], _: [u64; 4], _: u32, _: &[u8; 32]) -> Result<Vec<u8>> {
+    bail!("this proof is halo2; rebuild with --features zk-halo2 to prove it");
+}
+
+#[cfg(feature = "zk-halo2")]
+fn halo2_verify(digest: &[u8; 32], token: u32, vocab: u32, proof: &[u8]) -> Result<()> {
+    halo2_backend::verify(digest, token, vocab, proof)
+}
+
+#[cfg(not(feature = "zk-halo2"))]
+fn halo2_verify(_: &[u8; 32], _: u32, _: u32, _: &[u8]) -> Result<()> {
+    bail!("this proof is halo2; rebuild with --features zk-halo2 to verify it");
+}
+
+/// The halo2 formal-ZK backend uses a Poseidon commitment and a 32-byte salt;
+/// it reuses the transcript's backend-agnostic zk-digest and salt slots (the
+/// salt is stored as `[u64; 4]`, i.e. the same 32 bytes).
+#[cfg(feature = "zk-halo2")]
+mod halo2_backend {
+    use anyhow::Result;
+    use vllm_infer::engine::ZkCommitment;
+
+    fn u64_to_bytes(s: [u64; 4]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, w) in s.iter().enumerate() {
+            out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    fn bytes_to_u64(b: [u8; 32]) -> [u64; 4] {
+        let mut out = [0u64; 4];
+        for (i, w) in out.iter_mut().enumerate() {
+            *w = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+        out
+    }
+
+    /// Generation hook: commit a step's logits under a fresh salt.
+    pub fn zk_commit(q: &[i32]) -> std::result::Result<ZkCommitment, String> {
+        let salt = vllm_zk_halo2::random_salt();
+        let digest = vllm_zk_halo2::commit_logits(q, &salt).map_err(|e| e.to_string())?;
+        Ok(ZkCommitment {
+            salt: bytes_to_u64(salt),
+            digest,
+        })
+    }
+
+    /// Recompute a step's digest from trace logits + stored salt.
+    pub fn commit(logits: &[i32], salt: [u64; 4]) -> Result<[u8; 32]> {
+        Ok(vllm_zk_halo2::commit_logits(logits, &u64_to_bytes(salt))?)
+    }
+
+    pub fn prove(logits: &[i32], salt: [u64; 4], token: u32) -> Result<Vec<u8>> {
+        Ok(vllm_zk_halo2::prove_argmax(
+            logits,
+            &u64_to_bytes(salt),
+            token,
+        )?)
+    }
+
+    pub fn verify(digest: &[u8; 32], token: u32, vocab: u32, proof: &[u8]) -> Result<()> {
+        vllm_zk_halo2::verify_argmax(digest, token, vocab, proof)?;
+        Ok(())
+    }
 }

@@ -1,9 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/vllm-core", "crates/vllm-infer", "crates/vllm-verify", "crates/vllm-zk", "crates/vllm-cli"]
+members = ["crates/vllm-core", "crates/vllm-infer", "crates/vllm-verify", "crates/vllm-zk", "crates/vllm-zk-halo2", "crates/vllm-cli"]
+# vllm-zk-halo2 pulls in the halo2 proof-system tree; exclude it from the
+# default set so `cargo build`/`test` at the root stay fast. Build/test it with
+# `cargo test -p vllm-zk-halo2`.
+default-members = ["crates/vllm-core", "crates/vllm-infer", "crates/vllm-verify", "crates/vllm-zk", "crates/vllm-cli"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 

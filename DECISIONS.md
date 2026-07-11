@@ -240,3 +240,79 @@ Tested: a fully self-consistent cheat that shifts ONE element of one cell
 by ONE quantum (2^-8) — invisible at any float tolerance — is caught. This
 closes REPORT.md's bounded-drift attack for deterministic transcripts and
 makes them portable across machines/platforms (same binary version).
+
+## 17. Formal-ZK Layer 3: halo2 (transparent IPA), the `vllm-zk-halo2` crate
+
+Decision #13 shipped the argmax proof on winterfell and stated its one honest
+limitation loudly: winterfell 0.13 has no trace randomization, so the STARK is
+a succinct *argument*, not *formal* zero-knowledge — its query openings are
+random linear projections of (salt ‖ logits), reconstruction-safe but
+confirmation-unsafe. #13 named the two ways out: winterfell trace
+randomization (upstream, not shipped) or "a halo2 wrapper". This is the halo2
+wrapper, built as a sibling crate proving the identical statement — *the
+committed token is a maximum of the committed logit vector* — with genuine
+zero-knowledge.
+
+- **Why halo2/IPA.** halo2's inner-product-argument backend over the Pasta
+  curves is *transparent* (no trusted setup, like the STARK) and its prover
+  **blinds every committed polynomial**, so the proof is formally ZK. That is
+  exactly the property winterfell lacks; it is the whole reason this crate
+  exists. Field is `pallas::Base` (Fp); commitments live on Vesta (`EqAffine`).
+
+- **Commitment: a salted Poseidon hash chain, not a Rescue sponge.** The STARK
+  hand-rolled a Rescue AIR (#14) to match a native sponge. halo2_gadgets 0.5
+  already ships a Poseidon chip (`Pow5Chip`, width-3 rate-2 `P128Pow5T3`)
+  whose in-circuit output the crate's *own* tests pin equal to the native
+  `halo2_poseidon` primitive. So the commitment is a chain
+  `accᵢ₊₁ = Poseidon2(accᵢ, xᵢ)` seeded by a private `acc₀ = salt`, using that
+  vetted 2-to-1 primitive on both sides — native/in-circuit parity for free,
+  no bespoke hash AIR, and variable vocab handled by looping the gadget.
+  Chaining a collision-resistant compression is binding; the secret salt makes
+  the digest hiding.
+
+- **Argmax without a per-token key.** A running-selector region assigns one
+  logit per row with a boolean one-hot `pick`, and four running accumulators
+  (`rowidx = 0,1,2,…`, `sumsel = Σpick` pinned to 1, `selval = Σpick·x` pinned
+  to a broadcast maximum `xc`, `selidx = Σpick·rowidx` pinned to the public
+  index `c`). Together they force exactly one pick, at row `c`, with
+  `xc = x[c]`; a per-row range check `xc − x[i] ∈ [0, 2^DIFF_BITS)` (same
+  27-bit bound as #14) then gives `x[c] ≥ x[i]` for all `i`. Crucially `c` is
+  read from the **instance column via a copy constraint**, not baked into the
+  circuit — so a single verifying key serves every token index (a
+  key-per-token circuit would be 128k keys).
+
+- **Cost (measured, M-series, release).** vocab 32/128/256 → cold prove
+  1.3 / 5.5 / 11 s, IPA proof **~5 KB** (small and ~constant). But the cold
+  wall-clock is mostly *deterministic, cacheable* setup — IPA parameter
+  generation (`Params::new`) plus proving/verifying-key generation, all a pure
+  function of the vocab. The work a deployment that caches them pays is the
+  proving proper (`create_proof`: 0.4 / 1.6 / 3.1 s) and the *proof check*
+  (`verify_proof`: **6.7 / 20 / 37 ms**). IPA verification is linear in circuit
+  size (not a succinct verifier like KZG), so the check grows with vocab — ≈
+  seconds at 128k — but stays tiny at these sizes. The in-circuit Poseidon is
+  O(vocab): a real llama vocab (128 256) lands at k≈23 (a 2²³ ≈ 8M-row
+  circuit), minutes of proving and multiple GB. This is precisely the "millions
+  of rows — minutes of proving" #13 predicted for in-circuit Poseidon, and the
+  reason the STARK remains the default fast path (0.7 s, 78 KB) while this is
+  the opt-in *formal-ZK* path.
+
+- **Isolation and CLI wiring.** The halo2 tree is heavy, so the crate is a
+  workspace member **excluded from `default-members`** and pulled into
+  `vllm-cli` only behind an optional `zk-halo2` feature — the default `cargo
+  build` and `vllm` binary stay free of it (same isolation principle as #13).
+  It is wired as an alternate decode backend: `generate --prove-decode
+  --zk-backend halo2`, `prove-decode --backend halo2`, `verify-decode` (which
+  reads the backend from the proof envelope). The nice surprise: this needed
+  **no transcript-format change**. The chain absorbs a salted *32-byte* digest
+  per step regardless of which hash produced it, and the trace's salt slot is
+  `[u64; 4]` = the same 32 bytes — so the Poseidon digest and salt reuse the
+  existing Rescue slots (the CLI just converts `[u64;4]`↔`[u8;32]`). The
+  published v0.4 transcript format is untouched; a halo2 transcript replays and
+  binds its trace through the identical `vllm-core` machinery.
+
+- **Range check via bit decomposition.** `xc − x[i]` is decomposed into
+  DIFF_BITS booleans with a linear recomposition constraint — the simplest
+  construction that is unambiguously correct (no lookup-argument corner cases).
+  A limb + fixed-table lookup would cut the range-check column count ~9× and is
+  the obvious width optimization; correctness-first here, since formal-ZK at
+  128k is proving-bound regardless.

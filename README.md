@@ -16,6 +16,7 @@ composable layers of increasing cryptographic strength:
 | 1 — commitments | **v0.1 (done)** | BLAKE3 Merkle tree over GGUF tensors + hash chain over decode steps | Binding: the prover is committed to one specific (model, prompt, sampler, per-step logits, tokens) tuple and cannot rewrite history afterwards |
 | 2 — spot checks | **v0.2 (done)** | Fiat–Shamir challenges; verifier re-executes random single blocks on CPU | Probabilistic: cheating on a fraction *f* of the committed computation is caught with probability ≥ 1 − (1 − f)^k for k challenges |
 | 3 — ZK decode | **v0.3 (done, argmax)** | STARK proof that the emitted token is the argmax of the committed logit vector | The decode step is correct without revealing the logits (succinct argument; see the precise security statement below) |
+| 3′ — formal ZK decode | **v0.5 (done, argmax)** | halo2 (transparent IPA) proof of the *same* argmax statement, with polynomial blinding | Same guarantee, now **formally** zero-knowledge — the proof leaks nothing about the logits — at higher proving cost (see below) |
 
 ## Threat model (v0.1)
 
@@ -89,6 +90,16 @@ vllm generate --model $MODEL --tokenizer $TOK --prompt "..." \
 
 vllm prove-decode  --commitment run.json --trace run.trace --step 5 --out step5.proof.json
 vllm verify-decode --commitment run.json --proof step5.proof.json   # no model/GPU needed
+
+# --- v0.5: the same flow, formally zero-knowledge (build --features zk-halo2) ---
+# The digest is backend-agnostic in the transcript, so only the backend flag
+# changes; verify-decode reads which backend from the proof file.
+vllm generate --model $MODEL --tokenizer $TOK --prompt "..." \
+    --greedy --max-tokens 100 --commit run.json --trace run.trace \
+    --prove-decode --zk-backend halo2
+vllm prove-decode  --commitment run.json --trace run.trace --step 5 \
+    --backend halo2 --out step5.halo2.json
+vllm verify-decode --commitment run.json --proof step5.halo2.json
 ```
 
 `--bench` prints the commitment overhead. Measured on an M-series laptop,
@@ -205,9 +216,54 @@ of the (salt ‖ logits) vector. No individual logit can be reconstructed
 (the system is underdetermined by five orders of magnitude), and the salt
 prevents testing guessed vectors against the *digest*; but a party that
 already knows a candidate for the entire logit vector could confirm it
-from the openings. Full ZK is roadmap: trace randomization when winterfell
-ships it, or a halo2 wrapper (see DECISIONS.md #13). Top-p/temperature
-sampling proofs are also roadmap — v0.3 is argmax-only (greedy).
+from the openings. **v0.5 closes this** with a halo2 formal-ZK variant (see
+below); winterfell-native trace randomization remains a possible future.
+Top-p/temperature sampling proofs are also roadmap — both backends are
+argmax-only (greedy).
+
+## The formal-ZK decode proof (v0.5, halo2)
+
+`vllm-zk-halo2` proves the *same* statement as v0.3 — the emitted token is a
+maximum of the committed logit vector — but with genuine zero-knowledge
+instead of a leaky succinct argument. It commits the logits with a salted
+**Poseidon hash chain** (`accᵢ₊₁ = Poseidon2(accᵢ, xᵢ)`, `acc₀ = salt`) and
+proves argmax in a halo2 circuit: a running one-hot selector pins the public
+token index `c` (read from the instance column, so one key serves all tokens)
+and range-checked differences enforce `x[c] ≥ x[i]` for every `i`. halo2's
+inner-product-argument prover is **transparent** (no trusted setup, like the
+STARK) and **blinds its committed witness polynomials**, so — unlike
+winterfell — the proof reveals nothing about the logits beyond the public
+claim (the token is the argmax).
+
+The trade is proving cost: the commitment is an in-circuit Poseidon over the
+whole vocab, O(vocab) rows. Measured (M-series, release):
+
+| vocab | k | prove (cold) | prove (cached) | verify (cached) | proof |
+|---|---|---|---|---|---|
+| 32  | 12 | 1.3 s  | 0.4 s | 6.7 ms | ~5 KB |
+| 128 | 14 | 5.5 s  | 1.6 s | 20 ms  | ~5 KB |
+| 256 | 15 | 11 s   | 3.1 s | 37 ms  | ~5 KB |
+
+*Cold* is the stateless API: it regenerates the transparent IPA parameters and
+the proving/verifying keys on every call. That setup is deterministic (a pure
+function of the vocab) and dominates the cold wall-clock. *Cached* is what a
+real deployment pays once those are reused — the proving proper
+(`create_proof`) and the proof check (`verify_proof`). The check is
+milliseconds, but IPA verification is linear in circuit size (unlike a KZG
+SNARK), so it grows with vocab — ≈ seconds at a 128k vocab — while the proof
+stays ~5 KB.
+
+A real llama vocab (128 256) needs k≈23 (a 2²³ ≈ 8M-row circuit) — minutes of
+proving and multiple GB, the "millions of rows" tradeoff DECISIONS.md #13/#17
+anticipates. So the STARK stays the fast default (0.7 s prove, 78 KB) and this
+is the opt-in path when *formal* ZK is required.
+
+It is wired into the `vllm` CLI behind the `zk-halo2` build feature (so the
+default binary stays free of the heavy halo2 tree): `generate … --prove-decode
+--zk-backend halo2`, then `prove-decode … --backend halo2` and `verify-decode`.
+Because the salted 32-byte digest each backend folds into the hash chain is
+backend-agnostic, this needed **no transcript-format change** — the same
+`--trace`/chain machinery carries either a Rescue or a Poseidon digest.
 
 ## Workspace
 
@@ -222,6 +278,12 @@ sampling proofs are also roadmap — v0.3 is argmax-only (greedy).
 - `vllm-zk` — the Layer-3 STARK (winterfell): salted Rescue-Prime logits
   commitment + argmax AIR. Isolated so its dependencies don't infect the
   other crates (`vllm-infer` sees only a commitment callback).
+- `vllm-zk-halo2` — the Layer-3 **formal-ZK** variant (halo2 / transparent
+  IPA): a salted Poseidon commitment + argmax circuit whose *blinded* proof
+  leaks nothing about the logits. Same `commit / prove / verify` API as
+  `vllm-zk`. Heavy proof-system deps, so it is excluded from the default build
+  — `cargo test -p vllm-zk-halo2`, or `cargo run --release -p vllm-zk-halo2
+  --example bench_argmax`.
 
 Tests run without downloading weights: the integration test constructs a
 tiny random-weight 2-layer llama GGUF in memory (`vllm-core` has a GGUF
@@ -238,8 +300,9 @@ writer) and runs the full commit → generate → replay → tamper cycle on CPU
 - Float (Metal) transcripts are tolerance-verified — see the protocol
   section for the bounded-drift caveat; `--deterministic` transcripts
   verify exactly at ~8x lower generation speed and ~5 GB extra RAM.
-- v0.3 proves argmax (greedy) only, and is a succinct argument rather than
-  formal ZK — see the decode-proof section for the exact statement.
+- Both decode proofs are argmax (greedy) only. v0.3 (STARK) is a succinct
+  argument, not formal ZK; v0.5 (halo2) is formally ZK but O(vocab) to prove.
+  See the decode-proof sections for the exact statements and the tradeoff.
 - `--prove-decode` costs ~45 ms/token (native Rescue sponge over the 128k
   logit vector); opt-in.
 

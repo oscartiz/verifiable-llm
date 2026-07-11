@@ -14,6 +14,9 @@ vllm-core = { workspace = true }
 vllm-infer = { workspace = true }
 vllm-verify = { workspace = true }
 vllm-zk = { workspace = true }
+# Formal-ZK decode backend. Optional: its halo2 tree is heavy, so the default
+# `vllm` binary is built without it (enable with --features zk-halo2).
+vllm-zk-halo2 = { path = "../vllm-zk-halo2", optional = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -22,3 +25,4 @@ serde_json = { workspace = true }
 [features]
 default = ["metal"]
 metal = ["vllm-infer/metal"]
+zk-halo2 = ["dep:vllm-zk-halo2"]

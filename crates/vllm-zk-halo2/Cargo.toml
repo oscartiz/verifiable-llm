@@ -1,0 +1,24 @@
+[package]
+name = "vllm-zk-halo2"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Formally zero-knowledge (transparent IPA) proof that an emitted token is the argmax of a committed logit vector"
+
+# Heavy proof-system dependency tree; kept out of the workspace default-members
+# so the everyday `cargo build`/`cargo test` at the root stays fast. Build it
+# explicitly with `-p vllm-zk-halo2`.
+[dependencies]
+halo2_proofs = "0.3"
+halo2_gadgets = "0.5"
+pasta_curves = "0.5"
+group = "0.13"
+ff = "0.13"
+# OsRng for proof blinding (the source of the formal zero-knowledge property).
+rand = "0.8"
+
+[dev-dependencies]
+
+[[example]]
+name = "bench_argmax"
+path = "examples/bench_argmax.rs"
