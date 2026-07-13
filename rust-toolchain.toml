@@ -1,0 +1,9 @@
+# Pinned for reproducible builds and verification. Edition 2024 requires
+# Rust >= 1.85; this is the exact stable the workspace is developed and CI-
+# tested against. Bump deliberately (and re-run the full suite) rather than
+# floating on `stable`, so a verifier who checks out a tagged commit gets the
+# same compiler that produced the published commitments and benchmarks.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
