@@ -1,0 +1,503 @@
+\documentclass[11pt]{article}
+
+% Compiles with pdflatex (Overleaf: default). Only ubiquitous packages.
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\layer}[1]{\textsc{#1}}
+
+\title{\textbf{verifiable-llm}: Practical, Precisely-Scoped Provenance\\
+for Local Language-Model Inference}
+
+\author{Oscar Tiz\\ % TODO: set your name for submission
+\texttt{github.com/oscartiz/verifiable-llm}}
+
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+When a party claims ``model $M$ produced text $T$ from prompt $P$,'' a verifier
+normally has no way to check it: they cannot tell which weights ran, or whether
+the output was edited after the fact. Proving a full transformer forward pass in
+zero knowledge would settle the question but is infeasible on commodity
+hardware. We present \textbf{verifiable-llm}, a system that instead composes
+three layers of increasing cryptographic strength, each with an explicit and
+deliberately understated security statement. \layer{Layer~1} binds a claim to a
+specific $(\text{model}, \text{prompt}, \text{sampler}, \text{per-step logits},
+\text{tokens})$ tuple using a \textsc{blake3} Merkle commitment over the
+quantized weights and a domain-separated hash chain over decode steps.
+\layer{Layer~2} adds probabilistic soundness: Fiat--Shamir spot-check challenges
+that re-execute random blocks of the committed computation on CPU, catching a
+cheating prover with tunable probability. \layer{Layer~3} proves, in zero
+knowledge, that the emitted greedy token is the argmax of the committed logit
+vector, via a transparent STARK (fast; \emph{not} formally zero-knowledge) and a
+halo2 inner-product-argument variant (formally zero-knowledge; $O(\text{vocab})$
+to prove). A distinguishing feature is that the system quantifies an attack
+against \emph{its own} float-tolerance verifier---sub-tolerance perturbations are
+amplified $30$--$80\times$ by the network and can steer decoding---and closes it
+with a deterministic, exactly-verifiable backend. We report measured costs on an
+Apple~M4 laptop: a decode-argmax STARK proves in ${\approx}0.7$\,s and verifies
+in ${<}1$\,ms with ${\approx}78$\,KB proofs. The system is implemented in Rust
+($6$ crates) with adversarial tests that catch a cheating prover at every layer.
+\end{abstract}
+
+\section{Introduction}
+
+Text, code, and decisions increasingly come from large language models (LLMs)
+run locally on consumer hardware. This raises a provenance question with legal,
+scientific, and safety stakes: given an output, can a third party later verify
+\emph{which} model produced it and that the output was not fabricated or edited?
+Today the answer is essentially ``no''---the claimant controls the machine, and
+nothing binds the output to a computation.
+
+The cryptographic ideal is \emph{zero-knowledge machine learning} (zkML): prove
+in zero knowledge that $y = M(x)$ for a committed model $M$. For a
+billion-parameter transformer this is currently impractical on a laptop: the
+arithmetic circuit is enormous, and hiding it entirely is the wrong cost/benefit
+trade for most provenance needs. Rather than pay for the maximal guarantee,
+\textbf{verifiable-llm} decomposes the problem into layers whose guarantees a
+practitioner can compose and reason about, and states each guarantee with the
+precision an applied cryptographer would demand---including what it does
+\emph{not} provide.
+
+\paragraph{Contributions.}
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+\item A layered provenance protocol for local quantized-llama inference:
+binding commitments (\S\ref{sec:l1}), interactive spot checks with a quantified
+catch probability (\S\ref{sec:l2}), and zero-knowledge decode proofs
+(\S\ref{sec:l3}), each with a stated adversary and non-goals.
+\item An adversarial analysis of tolerance-based verification
+(\S\ref{sec:drift}): we show a prover running the \emph{real} model but
+perturbing every committed activation below the verifier's tolerance can steer
+greedy decoding, because the network amplifies sub-tolerance drift
+$30$--$80\times$. We close this with a deterministic, bit-exact backend whose
+challenges verify with \emph{zero} tolerance.
+\item Two interchangeable decode-argmax proof backends behind one commitment
+format (\S\ref{sec:l3}): a fast transparent STARK that is a succinct argument
+but not formally zero-knowledge, and a halo2 IPA circuit that is formally
+zero-knowledge at $O(\text{vocab})$ cost. We make the honest limitation of each
+explicit.
+\item An open-source Rust implementation and an evaluation on commodity hardware
+(\S\ref{sec:eval}), with reproducible proof-cost benchmarks and an adversarial
+test suite that catches a cheating prover at each layer.
+\end{itemize}
+
+\section{Threat Model and Design Goals}\label{sec:threat}
+
+\paragraph{Adversary.} The adversary is a \emph{prover}: a party who ran (or
+claims to have run) some computation and later wants to lie about it. Concretely
+the prover may (i) substitute, fine-tune, or re-quantize the model; (ii)
+fabricate logits or tokens that the model never produced; (iii) edit the
+transcript after generation; or (iv) attempt to answer verification challenges
+inconsistently with the committed computation. The verifier is honest but may be
+a \emph{different machine}, possibly without a GPU, that only exchanges files
+with the prover.
+
+\paragraph{Explicit non-goals.} We do \emph{not} prove a full forward pass in
+zero knowledge; we do not defend against a prover who honestly runs the correct
+model (that is the point of provenance, not an attack); and we do not certify
+model quality or safety. Sampler support for the strongest layer is greedy
+(argmax) decoding; top-$p$/temperature proofs are future work.
+
+\paragraph{Cryptographic assumptions.} Collision resistance of
+\textsc{blake3}~\cite{blake3}; the Fiat--Shamir heuristic in the random-oracle
+model~\cite{fiatshamir}; the conjectured soundness of the FRI-based
+STARK~\cite{stark} ($\approx\!100$-bit) and of the halo2 inner-product
+argument~\cite{bulletproofs,halo} over the Pasta curves. The deterministic
+backend additionally relies only on IEEE-754 being fully specified for the basic
+operations it uses.
+
+\section{Layer 1: Binding Commitments}\label{sec:l1}
+
+Layer~1 makes a claim \emph{binding}, not \emph{correct}: it pins exactly what
+was claimed so it cannot be rewritten, without yet asserting the computation was
+performed honestly.
+
+\paragraph{Model commitment.} We build a Merkle tree over the tensors of the
+GGUF weight file. Leaf $i$ is
+$\text{H}_{\text{leaf}}(\text{name}\,\|\,\text{ggml\_type}\,\|\,\text{shape}\,\|\,\text{raw quantized bytes})$,
+computed over the bytes \emph{exactly as stored on disk}---no dequantization, so
+nothing float-ambiguous enters the model commitment. Leaves are sorted by tensor
+name (so the root is invariant to on-disk order, which re-quantization tools may
+change) and combined with the RFC~6962 tree shape~\cite{rfc6962} using
+domain-separated leaf and node hashing (\code{vllm/merkle-leaf/v1},
+\code{vllm/merkle-node/v1}). Domain separation blocks second-preimage and
+leaf/internal-node confusion attacks; a single-leaf tree hashes under the leaf
+domain only, so it can never be reinterpreted as an interior node. Two files
+with the same root are byte-identical in every committed payload, name, type,
+and shape up to \textsc{blake3} collision resistance.
+
+\paragraph{Transcript hash chain.} Generation is bound by a running chain:
+\begin{align*}
+\text{chain}_0 &= \text{H}(\text{model\_root} \,\|\, \text{prompt\_tokens} \,\|\, \text{sampler\_cfg}),\\
+\text{chain}_i &= \text{H}(\text{chain}_{i-1} \,\|\, i \,\|\, \text{token}_i \,\|\, \text{H}(\text{quantize}(\text{logits}_i))).
+\end{align*}
+Every variable-length field is length-prefixed and every hash input is
+domain-tagged; the sampler configuration is committed as raw IEEE-754 bits (mode,
+temperature, top-$p$, RNG seed), avoiding JSON-canonicalization ambiguity.
+Logits are committed at fixed point, $q = \mathrm{round}(x \cdot 2^{16})$ as
+\code{i32}: coarse enough to hash stably on one backend, fine enough to leave the
+argmax and any downstream circuit unaffected (\S\ref{sec:l3}). \code{NaN} logits
+abort rather than being silently committed; $\pm\infty$ saturates. The final
+chain value binds the prover to one ordered tuple; any retroactive edit changes
+it, detectable by re-running the chain with no model or GPU.
+
+\paragraph{What Layer 1 does not do.} It does not prove the logits came from
+running $M$: a prover could commit to fabricated logits. Establishing that the
+committed computation actually follows from the committed weights is the job of
+Layer~2.
+
+\section{Layer 2: Interactive Spot Checks}\label{sec:l2}
+
+Generating with tracing additionally commits every intermediate activation
+\emph{cell} $(p, j)$---the hidden state entering block $j$ at position $p$, plus
+the state exiting the last block---quantized and folded into a Merkle tree whose
+root is bound into the chain as generation runs. A verifier then challenges a
+random subset and re-executes it.
+
+\paragraph{Challenge derivation.} The verifier (or a Fiat--Shamir transform)
+draws $k$ distinct cells from
+\[
+\text{XOF}\big(\text{final\_chain}\,\|\,\text{trace\_root}\,\|\,k\,\|\,\text{nonce}\,\|\,\text{space params}\big),
+\]
+where the space parameters (positions, layers, first-logit position) are
+absorbed so the challenge space cannot be reshaped. Sampling is without
+replacement.
+
+\paragraph{Response and check.} For each challenged block the prover reveals the
+block's committed input cells at positions $0..p$ and its output at $p$, each
+with a Merkle inclusion proof; the verifier re-executes the block with the
+committed weights over the revealed inputs and compares. Head challenges
+additionally reveal the step's quantized logits, which must hash \emph{exactly}
+to the chain's committed logits digest, and layer-$0$ inputs must equal the
+committed tokens' embeddings. The entire verifier runs on CPU, so a second
+machine without a GPU can check the claim.
+
+\paragraph{Soundness.} Call a \emph{cheat} a committed cell inconsistent with the
+committed model's computation on the committed inputs. If a fraction $f$ of the
+$N$ committed cells are cheats, then $k$ distinct challenges miss all of them
+with probability at most $(1-f)^k$; equivalently
+\[
+k = \left\lceil \frac{\ln \delta}{\ln(1-f)} \right\rceil
+\]
+challenges catch the prover with probability at least $1-\delta$
+(Table~\ref{tab:catch}). Sampling without replacement makes the bound tighter
+than the with-replacement $(1-f)^k$ it is stated against.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+cheat fraction $f$ & $k$ (95\%) & $k$ (99\%) & $k$ (99.9\%)\\
+\midrule
+20\% & 14 & 21 & 31\\
+10\% & 29 & 44 & 66\\
+5\%  & 59 & 90 & 135\\
+1\%  & 299 & 459 & 688\\
+\bottomrule
+\end{tabular}
+\caption{Distinct challenges needed to catch a prover cheating on a fraction $f$
+of committed cells, at the exact $\lceil \ln\delta / \ln(1-f)\rceil$ bound.}
+\label{tab:catch}
+\end{table}
+
+\paragraph{Grinding.} With a pure Fiat--Shamir (empty) nonce a prover can
+re-generate until the derived challenges miss its cheats, at expected cost
+$(1-f)^{-k}$ generations. A verifier-chosen nonce, issued \emph{after} the
+transcript is committed, removes this entirely; the prover's \code{respond}
+refuses any challenge that is not the exact derivation for the committed
+$(\text{transcript}, \text{nonce})$.
+
+\section{The Bounded-Drift Attack and Deterministic Verification}\label{sec:drift}
+
+Layer~2's re-execution cannot use exact equality on the default path.
+Cross-backend logit reproduction is impossible at any usable precision: on
+Llama-3.2-1B~\cite{llama3} Q4\_K\_M we measure a maximum absolute CPU-versus-Metal
+logit deviation of ${\approx}0.49$ (mean ${\approx}0.08$) over the $128{,}256$-dim
+vector, from differing quantized matmul kernels; the argmax agrees but hash
+equality fails at every precision. The verifier therefore accepts a re-executed
+block within a per-element tolerance $\tau$.
+
+This opens an escape hatch, which we quantify against \emph{our own} system. An
+adversary who runs the real model but adds a perturbation $\delta$ with
+$\|\delta\|_\infty \le \tau$ at every committed cell produces a trace that is
+self-consistent up to $\tau$ and passes every per-element challenge by
+construction. The question is what that buys at the output. We find:
+
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+\item \textbf{Amplification.} A single $\pm\tau$ injection at one hook displaces
+the final logits by $30$--$80\times\,\tau$ (Jacobian amplification through the
+remaining blocks), saturating around $40$--$70\times$ at $\tau = 0.5$.
+\item \textbf{Token steering.} Against an honest top-1/top-2 logit gap with
+$10$th percentile ${\approx}0.33$, random full-stack $\pm\tau$ drift flips the
+first token within ${\approx}10$ steps even at $\tau = 0.01$---below the honest
+cross-backend noise floor itself. A targeted last-layer perturbation
+$\delta = \tau\cdot\mathrm{sign}(w_b - w_a)$ (from the top-2 LM-head rows) flips
+the argmax of $24$ of $48$ steps at $\tau = 0.01$.
+\end{itemize}
+
+Per-element tolerance therefore cannot guarantee token provenance for a float
+transformer: this is a structural limit, not a parameter-tuning bug. A shipped
+distributional check (a per-cell \emph{mean}-deviation bound, exploiting that
+honest drift concentrates two orders of magnitude below its own max) narrows the
+attack ${\approx}10\times$ but does not close it, and we say so.
+
+\paragraph{The fix is determinism.} We add a fixed-evaluation-order CPU backend
+(\code{det-cpu-v1}) that is bit-identical across runs and machines. It requires
+exactly three things: (i) fixed reduction order (sequential scalar loops;
+parallelism only over independent outputs), so IEEE-754's exact specification for
+$+,-,\times,\div,\sqrt{}$ makes the result deterministic; (ii) no \code{libm}
+(fixed-order polynomial \code{exp}/\code{sin}/\code{cos}, ${\approx}10^{-13}$
+relative error); and (iii) requantization of the hidden state to the trace grid
+at every hook, so a committed cell \emph{is} the computation state and the
+verifier's recomputation is bit-identical. Verification then uses exact
+\code{i32} equality with \emph{zero} tolerance: a single-quantum ($2^{-8}$)
+perturbation on one element of one cell---undetectable at any float
+tolerance---is caught. This closes the bounded-drift attack for deterministic
+transcripts, at ${\approx}8\times$ lower generation throughput and
+${\approx}5$\,GB extra memory (weights dequantized to \code{f32} up front).
+
+\section{Layer 3: Zero-Knowledge Decode Proofs}\label{sec:l3}
+
+Layers~1--2 establish that the committed logits are the model's true logits
+(exactly, on the deterministic path; within an accumulated drift bound on the
+float path). Layer~3 proves the emitted token was chosen correctly from those
+logits, without revealing them. Both backends prove the same statement about one
+greedy step:
+\begin{quote}\itshape
+For a public token index $c$ and a chain-bound digest $d$, the prover knows a
+logit vector $x$ and salt $s$ such that $\mathrm{Commit}_s(x) = d$ and
+$x[c] \ge x[i]$ for every $i$.
+\end{quote}
+
+\paragraph{Argmax by range check.} Both circuits introduce a private
+claimed-maximum $m$ and enforce $m - x[i] \in [0, 2^{27})$ for all $i$ via a
+$27$-bit decomposition, together with $x[c] = m$ selected at the public index.
+Because $2^{27}$ is far below the field modulus, the field difference equals the
+true signed-integer difference with no wraparound; a non-maximal claim forces
+some $m - x[j] < 0$, i.e.\ a field element ${\approx}\!p$, which no $27$-bit
+witness can represent, so the proof is infeasible. The bound caps the provable
+logit spread at $2^{27}/2^{16} = 2048$ units, comfortably above observed spreads
+(${\approx}40$).
+
+\subsection{STARK backend (winterfell): the fast default}
+The commitment is a salted Rescue-Prime~\cite{rescue} sponge over the Goldilocks
+field, with the salt as a private capacity IV. An algebraic intermediate
+representation (AIR) recomputes the sponge from the witness logits \emph{inside}
+the proof (one Rescue round per row, one logit absorbed per row on average) and
+simultaneously enforces the argmax constraints above via a boolean selector
+column that must sum to one and may fire only at row $c$.
+
+\emph{Security, stated precisely.} This is a succinct, \emph{transparent}
+argument of knowledge (no trusted setup) with ${\approx}100$-bit conjectured
+security, and the commitment is binding. It is \textbf{not} formal
+zero-knowledge: the STARK library has no trace randomization, so each proof
+reveals the trace polynomials' evaluations at the ${\approx}27$ FRI query points
+of a coset domain---equivalently ${\approx}27$ random linear projections of the
+$(\text{salt}\,\|\,\text{logits})$ vector. No individual logit is recoverable
+(the system is underdetermined by ${\approx}5$ orders of magnitude, and the salt
+blocks digest-level guessing), but a party already holding a candidate for the
+\emph{entire} logit vector could confirm it. We call this reconstruction-safe but
+confirmation-unsafe.
+
+\subsection{halo2 backend: formal zero-knowledge}
+The commitment is a salted Poseidon~\cite{poseidon} hash chain
+$\text{acc}_{i+1} = \mathrm{Poseidon2}(\text{acc}_i, x_i)$, $\text{acc}_0 = s$,
+using the same primitive the in-circuit gadget realizes (native/in-circuit
+parity is pinned by tests). A running one-hot selector proves the argmax without
+a per-token key: four running accumulators force exactly one selected row, at the
+public index $c$ read from the instance column via a copy constraint, with the
+selected value equal to a broadcast maximum---so a single verifying key serves
+every token. The prover is halo2's inner-product argument over the Pasta curves:
+\emph{transparent} (no trusted setup, like the STARK) \emph{and} it blinds every
+committed witness polynomial, so the proof reveals nothing about the logits
+beyond the public claim.
+
+\emph{The cost.} The commitment is an in-circuit Poseidon over the whole vocab,
+$O(\text{vocab})$ rows. This is affordable for small vocabularies but, projected
+to a real llama vocabulary of $128{,}256$, requires a ${\approx}2^{23}$-row
+circuit---minutes of proving and multiple GB. The STARK therefore remains the
+fast default; halo2 is the opt-in path when \emph{formal} zero-knowledge is
+required. Crucially, both backends fold a salted $32$-byte digest into the same
+chain, so the transcript format is backend-agnostic and unchanged.
+
+\paragraph{Composition.} Combining the layers: the emitted token is the exact
+argmax of logits that are the committed model's true logits on the committed
+inputs---exactly on the deterministic path, and within the accumulated drift
+bound on the float path.
+
+\section{Implementation}\label{sec:impl}
+
+\textbf{verifiable-llm} is ${\approx}5{,}800$ lines of Rust across six crates.
+\code{vllm-core} (GGUF parsing, Merkle tree, hash chain, transcript/trace/challenge
+formats) depends only on \textsc{blake3} and \code{serde}, so a verifier builds
+it anywhere without a GPU or ML framework. \code{vllm-infer} vendors candle's
+quantized-llama with commitment hooks and the deterministic backend;
+\code{vllm-verify} is the CPU re-execution verifier; \code{vllm-zk} and
+\code{vllm-zk-halo2} are the two Layer-3 backends, isolated so their heavy
+proof-system dependencies do not affect the default build; and \code{vllm-cli}
+is the \code{vllm} binary. Attacker-controlled inputs (transcript, challenge,
+response, and proof JSON) are parsed fail-closed: malformed input yields a clean
+error, never a panic. Integration tests construct a tiny in-memory GGUF, so
+continuous integration never downloads weights, and include a cheating prover
+that is \emph{caught} at each layer: a self-consistent but incorrect trace
+(caught by re-execution), sub-tolerance drift (caught by the mean check), a
+single quantum under determinism (caught by exact equality), and forged Merkle
+proofs, edited transcripts, wrong-salt digests, and mistagged decode proofs (all
+rejected).
+
+\section{Evaluation}\label{sec:eval}
+
+We measure on an Apple~M4 MacBook~Air (16\,GB, macOS~26.5.1, \code{rustc}~1.95.0,
+release build). Proof-cost benchmarks use synthetic logits and need no model
+download; model-dependent numbers use Llama-3.2-1B-Instruct Q4\_K\_M.
+
+\paragraph{Layer-3 proof costs.} Table~\ref{tab:l3} contrasts the two backends.
+The STARK proves a $128{,}256$-vocab decode step in ${\approx}0.7$\,s and
+verifies in under a millisecond with ${\approx}78$\,KB proofs; the native
+commitment costs ${\approx}45$--$80$\,ms/token (machine-dependent) and is
+opt-in. The halo2 backend (Table~\ref{tab:halo2}) is formally zero-knowledge but
+$O(\text{vocab})$: at small vocabularies its \emph{cached} prove (reusing the
+deterministic, cacheable parameters and keys) is $0.4$--$3.0$\,s with a flat
+${\approx}5$\,KB proof, but its verification is linear in circuit size and it
+does not scale to a full vocabulary in seconds.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+ & STARK (\code{vllm-zk}) & halo2 (\code{vllm-zk-halo2})\\
+\midrule
+setup & none (transparent) & none (transparent)\\
+formal ZK & no & \textbf{yes}\\
+prove (vocab 128k) & ${\approx}0.7$\,s & minutes (est.)\\
+verify & ${\approx}0.6$\,ms & seconds (est.)\\
+proof size & $76$--$79$\,KiB & ${\approx}5$\,KB\\
+commit / token & ${\approx}45$--$80$\,ms & $O(\text{vocab})$\\
+\bottomrule
+\end{tabular}
+\caption{Decode-argmax proof backends. Both are transparent; they trade formal
+zero-knowledge against proving cost at a real vocabulary.}
+\label{tab:l3}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{rccccc}
+\toprule
+vocab & $k$ & prove (cold) & prove (cached) & verify (cached) & proof\\
+\midrule
+32  & 12 & $1.30$\,s  & $0.42$\,s & $17.5$\,ms & 5\,KB\\
+128 & 14 & $5.46$\,s  & $1.50$\,s & $19.6$\,ms & 5\,KB\\
+256 & 15 & $10.96$\,s & $2.96$\,s & $38.1$\,ms & 5\,KB\\
+\bottomrule
+\end{tabular}
+\caption{halo2 formal-ZK backend, Apple~M4. \emph{Cold} regenerates the
+deterministic IPA parameters and keys per call; \emph{cached} is the per-proof
+cost once they are reused.}
+\label{tab:halo2}
+\end{table}
+
+\paragraph{Commitment overhead and throughput.} On the default Metal path the
+Layer-1 commitment work is $2.6\%$ of inference time at warm-cache decode speed
+(${\approx}79$\,tok/s), $0.4\%$ cold. The Layer-2 verifier re-executes roughly
+$k/L$ prompt-forward equivalents; $60$ challenges over a $60$-position trace
+verify in ${\approx}2$\,s on CPU.
+
+\paragraph{Deterministic backend.} On the 1B model the deterministic backend
+decodes at $10.2$\,tok/s (versus ${\approx}80$ on Metal), loads in $2.2$\,s, and
+is bit-identical across runs; $20$ real-model challenges verify with exactly
+zero deviation. This is the configuration that gives exact token provenance.
+
+\section{Related Work}\label{sec:related}
+
+\emph{zkML.} Systems such as those of Kang et al.~\cite{zkml} and toolchains like
+ezkl~\cite{ezkl} prove DNN inference in zero knowledge, typically for smaller
+models or restricted layers, and often with a trusted setup. We deliberately do
+\emph{not} prove the forward pass; our zero-knowledge component is confined to
+the decode (argmax) step, which keeps the strongest guarantee tractable on a
+laptop while the cheaper layers cover the rest of the computation.
+
+\emph{Verifiable computation and spot checks.} Re-executing a random subset of a
+committed computation echoes probabilistically checkable verification and
+Freivalds' randomized checking~\cite{freivalds}; our Layer~2 applies it to
+transformer blocks with a Merkle-committed activation trace and a Fiat--Shamir
+(or interactive-nonce) challenge.
+
+\emph{Transparency logs.} The append-only, domain-separated Merkle construction
+follows Certificate Transparency (RFC~6962)~\cite{rfc6962}; we reuse its tree
+shape and second-preimage hardening for the model commitment.
+
+\emph{Proof systems.} We build on FRI-based STARKs~\cite{stark} and the halo2
+inner-product argument~\cite{bulletproofs,halo}, with Rescue-Prime~\cite{rescue}
+and Poseidon~\cite{poseidon} as circuit-friendly commitments.
+
+\section{Limitations and Future Work}\label{sec:limits}
+
+The strongest guarantee is confined to greedy decoding; committed-seed top-$p$
+and temperature proofs are future work. The halo2 backend, though formally
+zero-knowledge, is demonstrated only at small vocabularies; a full-vocabulary
+formal-ZK decode proof is minutes-to-GB and not yet practical. The STARK's lack
+of trace randomization makes it an argument, not formal ZK; a wrapping or
+upstream trace randomization would remove the residual confirmation risk. The
+commitment binds the quantized bytes and backend, not a hardware attestation:
+the deterministic backend gives cross-machine reproducibility for a fixed binary
+version, but a malicious runtime substituting the binary is out of scope. Like
+all research cryptography, the constructions are unaudited.
+
+\section{Conclusion}\label{sec:conclusion}
+
+\textbf{verifiable-llm} shows that useful, checkable provenance for local LLM
+inference is achievable today by declining to solve the hardest version of the
+problem and instead composing layered guarantees with honest, quantified
+security statements. Its most transferable contribution may be methodological:
+it attacks its own weakest layer, measures exactly how far the attack reaches,
+and ships a fix rather than a caveat. The result is a system whose credibility
+rests on precision and understatement---a stance we believe applied
+cryptographic systems should adopt more often.
+
+\begin{thebibliography}{99}
+\small
+\bibitem{blake3} J.-P. Aumasson, S. Neves, Z. Wilcox-O'Hearn, and J. O'Connor.
+\emph{BLAKE3: One Function, Fast Everywhere.} Specification, 2020.
+\bibitem{rfc6962} B. Laurie, A. Langley, and E. Kasper. \emph{Certificate
+Transparency.} RFC~6962, IETF, 2013.
+\bibitem{fiatshamir} A. Fiat and A. Shamir. \emph{How to Prove Yourself:
+Practical Solutions to Identification and Signature Problems.} CRYPTO, 1986.
+\bibitem{stark} E. Ben-Sasson, I. Bentov, Y. Horesh, and M. Riabzev.
+\emph{Scalable, Transparent, and Post-Quantum Secure Computational Integrity.}
+IACR ePrint 2018/046.
+\bibitem{bulletproofs} B. B\"unz, J. Bootle, D. Boneh, A. Poelstra, P. Wuille,
+and G. Maxwell. \emph{Bulletproofs: Short Proofs for Confidential Transactions
+and More.} IEEE S\&P, 2018.
+\bibitem{halo} S. Bowe, J. Grigg, and D. Hopwood. \emph{Recursive Proof
+Composition without a Trusted Setup (Halo).} IACR ePrint 2019/1021.
+\bibitem{poseidon} L. Grassi, D. Khovratovich, C. Rechberger, A. Roy, and
+M. Schofnegger. \emph{Poseidon: A New Hash Function for Zero-Knowledge Proof
+Systems.} USENIX Security, 2021.
+\bibitem{rescue} A. Aly, T. Ashur, E. Ben-Sasson, S. Dhooghe, and
+A. Szepieniec. \emph{Design of Symmetric-Key Primitives for Advanced
+Cryptographic Protocols (Rescue-Prime).} IACR Trans.\ Symmetric Cryptology,
+2020.
+\bibitem{zkml} D. Kang, T. Hashimoto, I. Stoica, and Y. Sun. \emph{Scaling up
+Trustless DNN Inference with Zero-Knowledge Proofs.} arXiv:2210.08674, 2022.
+\bibitem{ezkl} ezkl contributors. \emph{ezkl: Zero-Knowledge Inference for Neural
+Networks.} \url{https://github.com/zkonduit/ezkl}.
+\bibitem{freivalds} R. Freivalds. \emph{Probabilistic Machines Can Use Less
+Running Time.} IFIP Congress, 1977.
+\bibitem{llama3} Llama Team, AI @ Meta. \emph{The Llama 3 Herd of Models.}
+arXiv:2407.21783, 2024.
+\end{thebibliography}
+
+\end{document}
