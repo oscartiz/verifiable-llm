@@ -20,5 +20,5 @@ rand = "0.8"
 [dev-dependencies]
 
 [[example]]
-name = "bench_argmax"
-path = "examples/bench_argmax.rs"
+name = "bench_argmax_halo2"
+path = "examples/bench_argmax_halo2.rs"

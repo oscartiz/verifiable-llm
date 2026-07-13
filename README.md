@@ -283,7 +283,7 @@ backend-agnostic, this needed **no transcript-format change** — the same
   leaks nothing about the logits. Same `commit / prove / verify` API as
   `vllm-zk`. Heavy proof-system deps, so it is excluded from the default build
   — `cargo test -p vllm-zk-halo2`, or `cargo run --release -p vllm-zk-halo2
-  --example bench_argmax`.
+  --example bench_argmax_halo2`.
 
 Tests run without downloading weights: the integration test constructs a
 tiny random-weight 2-layer llama GGUF in memory (`vllm-core` has a GGUF
