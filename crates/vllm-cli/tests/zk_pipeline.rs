@@ -81,6 +81,136 @@ fn zk_commit_prove_verify_pipeline() {
     std::fs::remove_file(&trace_path).ok();
 }
 
+/// End-to-end through the actual `vllm` binary: a valid winterfell decode
+/// proof verifies, and the two envelope-level cheats the audit flagged are
+/// rejected — a forged proof body and a mistagged backend — with a clean
+/// non-zero exit (no panic, no accidental acceptance).
+#[test]
+fn verify_decode_binary_rejects_forged_and_mistagged_proofs() {
+    use std::process::Command;
+
+    let model_path = temp("vd-model", "gguf");
+    std::fs::write(&model_path, tiny_llama_gguf()).unwrap();
+    let trace_path = temp("vd-trace", "trace");
+    let commitment = commit::commit_gguf(&model_path).unwrap();
+
+    let req = GenerateRequest {
+        model_path: model_path.clone(),
+        tokenizer_path: None,
+        prompt: Prompt::Tokens(vec![1, 2, 3]),
+        raw: true,
+        max_new_tokens: 6,
+        sampler: SamplerConfig::greedy(),
+        logit_frac_bits: 16,
+        force_cpu: true,
+        trace_path: Some(trace_path.clone()),
+        zk_commit: Some(Box::new(|q: &[i32]| {
+            let salt = vllm_zk::random_salt();
+            let digest = vllm_zk::commit_logits(q, salt).map_err(|e| e.to_string())?;
+            Ok(ZkCommitment { salt, digest })
+        })),
+        deterministic: false,
+    };
+    let t = generate(&req, &commitment, None).unwrap().transcript;
+    let transcript_path = temp("vd-transcript", "json");
+    std::fs::write(&transcript_path, serde_json::to_string(&t).unwrap()).unwrap();
+
+    // Build a genuine winterfell decode-proof envelope for step 3.
+    let step = 3usize;
+    let mut reader = TraceReader::open(&trace_path).unwrap();
+    let salts = reader.meta().zk_salts.clone().unwrap();
+    let logits = reader.logits_row(step as u32).unwrap();
+    let token = t.steps[step].token_id;
+    let digest = t.steps[step].zk_digest.unwrap();
+    let proof = vllm_zk::prove_argmax(&logits, salts[step], token).unwrap();
+    let envelope = serde_json::json!({
+        "version": "vllm/zk-proof/v1",
+        "backend": "winterfell",
+        "step": step,
+        "token_id": token,
+        "vocab_size": t.vocab_size,
+        "digest": digest.to_hex(),
+        "proof": vllm_core::protocol::b64_encode(&proof),
+    });
+
+    let vllm = env!("CARGO_BIN_EXE_vllm");
+    let run = |proof_path: &std::path::Path| {
+        Command::new(vllm)
+            .args(["verify-decode", "--commitment"])
+            .arg(&transcript_path)
+            .arg("--proof")
+            .arg(proof_path)
+            .output()
+            .expect("spawn vllm")
+    };
+
+    // (0) The honest proof verifies.
+    let good = temp("vd-proof-good", "json");
+    std::fs::write(&good, serde_json::to_string_pretty(&envelope).unwrap()).unwrap();
+    let out = run(&good);
+    assert!(
+        out.status.success(),
+        "honest proof rejected: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (1) Forged proof body: flip one base64 char of the proof. Must be
+    //     rejected (proof no longer verifies against the digest).
+    let mut forged = envelope.clone();
+    let mut pb: String = forged["proof"].as_str().unwrap().to_string();
+    let mid = pb.len() / 2;
+    let ch = pb.as_bytes()[mid];
+    let repl = if ch == b'A' { 'B' } else { 'A' };
+    pb.replace_range(mid..mid + 1, &repl.to_string());
+    forged["proof"] = serde_json::Value::String(pb);
+    let forged_path = temp("vd-proof-forged", "json");
+    std::fs::write(&forged_path, serde_json::to_string_pretty(&forged).unwrap()).unwrap();
+    let out = run(&forged_path);
+    assert!(!out.status.success(), "forged proof was accepted");
+
+    // (2) Mistagged backend: relabel the (valid winterfell) proof as halo2.
+    //     Without the zk-halo2 feature the binary refuses it; with it, the
+    //     halo2 verifier rejects a winterfell proof. Either way: not accepted.
+    let mut mistagged = envelope.clone();
+    mistagged["backend"] = serde_json::Value::String("halo2".into());
+    let mistagged_path = temp("vd-proof-mistagged", "json");
+    std::fs::write(
+        &mistagged_path,
+        serde_json::to_string_pretty(&mistagged).unwrap(),
+    )
+    .unwrap();
+    let out = run(&mistagged_path);
+    assert!(!out.status.success(), "mistagged backend was accepted");
+
+    // (3) Unknown backend tag: fail closed with a clear error, no panic.
+    let mut unknown = envelope.clone();
+    unknown["backend"] = serde_json::Value::String("bogus".into());
+    let unknown_path = temp("vd-proof-unknown", "json");
+    std::fs::write(
+        &unknown_path,
+        serde_json::to_string_pretty(&unknown).unwrap(),
+    )
+    .unwrap();
+    let out = run(&unknown_path);
+    assert!(!out.status.success(), "unknown backend tag was accepted");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown decode-proof backend"),
+        "expected a clear unknown-backend error"
+    );
+
+    for p in [
+        &model_path,
+        &trace_path,
+        &transcript_path,
+        &good,
+        &forged_path,
+        &mistagged_path,
+        &unknown_path,
+    ] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
 // The 32-byte zk-digest and salt slots the engine/trace expose are backend
 // agnostic; the halo2 backend stores its 32-byte salt in the `[u64; 4]` slot.
 #[cfg(feature = "zk-halo2")]
