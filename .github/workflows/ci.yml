@@ -14,11 +14,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Honor rust-toolchain.toml (pinned stable) rather than floating latest.
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - run: cargo test --workspace --no-default-features
+
+  # Formal-ZK backend (halo2). Excluded from default-members and gated behind a
+  # cargo feature, so the everyday build stays light — but the CLI wiring and the
+  # end-to-end halo2 decode-proof pipeline must still be built and tested here.
+  linux-halo2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p vllm-cli --all-targets --no-default-features --features zk-halo2 -- -D warnings
+      - run: cargo test -p vllm-cli --no-default-features --features zk-halo2
+      - run: cargo test -p vllm-zk-halo2
 
   # Metal feature compiles on macOS; tests still force CPU (runners have no
   # usable GPU), so this checks the prover-side build end to end.
@@ -26,6 +44,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
