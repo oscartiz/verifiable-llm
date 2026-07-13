@@ -7,6 +7,25 @@ Verifiable local LLM inference on Apple Silicon: run a quantized llama GGUF
 with [candle] and produce cryptographic commitments to *which model* ran and
 *what it computed*, so a third party can check the claim later.
 
+**Why this matters.** When someone hands you text and says "model M wrote
+this," you normally just have to trust them — there's no way to check which
+model ran, or whether the output was quietly edited afterward. This project
+makes that claim *checkable* after the fact, on a laptop, in three layers of
+increasing strength. **Layer 1** cryptographically pins the exact model weights
+and the exact prompt/output, so the history can't be rewritten. **Layer 2** lets
+a verifier re-run random pieces of the computation and catch a prover who
+fabricated the output, with a probability they can dial up. **Layer 3** proves —
+in zero knowledge — that the emitted token really was the model's top-scoring
+choice, without revealing the model's internal scores. The formal statements
+live in [`docs/protocol.md`](docs/protocol.md); every performance number, with
+its command, is in [`BENCHMARKS.md`](BENCHMARKS.md).
+
+> **Demo.** [`scripts/demo.sh $MODEL $TOK`](scripts/demo.sh) runs the whole flow
+> end to end — commit → generate → replay → challenge → respond → verify →
+> prove-decode → verify-decode — in ~60–90 s. Record a cast with
+> `asciinema rec docs/demo.cast -c "scripts/demo.sh model.gguf tokenizer.json"`
+> (the script prints each command as it runs).
+
 **This does NOT prove a full transformer forward pass in zero knowledge.**
 That is infeasible on a laptop and is an explicit non-goal. Instead, three
 composable layers of increasing cryptographic strength:
@@ -151,14 +170,17 @@ computation on the committed inputs. With N committed cells and a fraction
 f of them inconsistent, k uniformly sampled distinct challenges miss all of
 them with probability ≤ (1 − f)^k, so
 
-    k = ⌈ln(1/δ) / f⌉  challenges catch the prover with probability ≥ 1 − δ.
+    k = ⌈ln δ / ln(1 − f)⌉  challenges catch the prover with probability ≥ 1 − δ
+
+(the table below uses this exact bound; the looser rule of thumb
+⌈ln(1/δ) / f⌉ over-estimates k by up to one challenge).
 
 | cheat fraction f | k for 95 % | k for 99 % | k for 99.9 % |
 |---|---|---|---|
 | 20 % | 14 | 21 | 31 |
 | 10 % | 29 | 44 | 66 |
 | 5 %  | 59 | 90 | 135 |
-| 1 %  | 300 | 459 | 688 |
+| 1 %  | 299 | 459 | 688 |
 
 `-k` is configurable on `vllm challenge`. Cost: the verifier re-executes k
 single blocks over their position prefixes — roughly k/L prompt-forward
@@ -305,5 +327,18 @@ writer) and runs the full commit → generate → replay → tamper cycle on CPU
   See the decode-proof sections for the exact statements and the tradeoff.
 - `--prove-decode` costs ~45 ms/token (native Rescue sponge over the 128k
   logit vector); opt-in.
+
+## Documentation
+
+- [`docs/protocol.md`](docs/protocol.md) — the formal statement for each layer
+  (what is bound, what is proven, the exact adversary).
+- [`DECISIONS.md`](DECISIONS.md) — design rationale, with the data behind each
+  non-obvious choice.
+- [`BENCHMARKS.md`](BENCHMARKS.md) — every quoted number with its command,
+  hardware, and date.
+- [`REPORT.md`](REPORT.md) — the bounded-drift adversary experiment.
+- [`SECURITY.md`](SECURITY.md) — this is research code, not audited; how to
+  report soundness issues. [`CONTRIBUTING.md`](CONTRIBUTING.md) — dev loop and
+  house rules.
 
 [candle]: https://github.com/huggingface/candle
