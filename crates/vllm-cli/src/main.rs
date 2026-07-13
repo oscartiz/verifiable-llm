@@ -247,8 +247,18 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         .with_context(|| format!("parsing {path:?}"))
 }
 
+/// Read a transcript and fail closed on structurally invalid input (empty
+/// prompt, degenerate trace) before any command touches its positions.
+fn load_transcript(path: &Path) -> Result<Transcript> {
+    let transcript: Transcript = read_json(path)?;
+    transcript
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid transcript {path:?}: {e}"))?;
+    Ok(transcript)
+}
+
 fn cmd_challenge(commitment: &Path, k: u32, nonce: &str, out: &Path) -> Result<()> {
-    let transcript: Transcript = read_json(commitment)?;
+    let transcript: Transcript = load_transcript(commitment)?;
     if transcript.replay_chain() != ChainCheck::Ok {
         bail!("transcript chain does not replay; refusing to challenge it");
     }
@@ -272,7 +282,7 @@ fn cmd_challenge(commitment: &Path, k: u32, nonce: &str, out: &Path) -> Result<(
 }
 
 fn cmd_respond(commitment: &Path, trace: &Path, challenge: &Path, out: &Path) -> Result<()> {
-    let transcript: Transcript = read_json(commitment)?;
+    let transcript: Transcript = load_transcript(commitment)?;
     let challenge: vllm_core::protocol::Challenge = read_json(challenge)?;
     // Refuse challenges that are not the honest FS derivation.
     let expected = vllm_core::protocol::make_challenge(&transcript, challenge.k, &challenge.nonce)?;
@@ -306,7 +316,7 @@ fn cmd_verify(
     logits_tolerance: Option<f32>,
     mean_tolerance: f32,
 ) -> Result<()> {
-    let transcript: Transcript = read_json(commitment)?;
+    let transcript: Transcript = load_transcript(commitment)?;
     let challenge: vllm_core::protocol::Challenge = read_json(challenge)?;
     let response: vllm_core::protocol::Response = read_json(response)?;
     let config = vllm_verify::VerifyConfig {
@@ -557,7 +567,7 @@ fn cmd_prove_decode(
     out: &Path,
     backend: ZkBackend,
 ) -> Result<()> {
-    let transcript: Transcript = read_json(commitment)?;
+    let transcript: Transcript = load_transcript(commitment)?;
     if transcript.replay_chain() != ChainCheck::Ok {
         bail!("transcript chain does not replay");
     }
@@ -622,7 +632,7 @@ fn cmd_prove_decode(
 }
 
 fn cmd_verify_decode(commitment: &Path, proof_path: &Path) -> Result<()> {
-    let transcript: Transcript = read_json(commitment)?;
+    let transcript: Transcript = load_transcript(commitment)?;
     let envelope: DecodeProof = read_json(proof_path)?;
     let backend = match envelope.backend.as_str() {
         "winterfell" => ZkBackend::Winterfell,

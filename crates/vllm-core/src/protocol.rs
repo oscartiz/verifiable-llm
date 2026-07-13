@@ -58,6 +58,9 @@ pub struct ChallengeSpace {
 
 impl ChallengeSpace {
     pub fn from_transcript(t: &Transcript) -> Result<Self, Error> {
+        // Fail closed on malformed input (empty prompt, degenerate trace)
+        // before any position arithmetic can underflow.
+        t.validate().map_err(Error::Gguf)?;
         let trace = t
             .trace
             .as_ref()

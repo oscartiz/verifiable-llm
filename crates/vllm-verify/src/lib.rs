@@ -127,6 +127,12 @@ pub fn verify(
     response: &Response,
     config: &VerifyConfig,
 ) -> Result<VerifyReport> {
+    // 0. Structural sanity on the attacker-controlled transcript, before any
+    //    position arithmetic — fail closed rather than underflow.
+    transcript
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid transcript: {e}"))?;
+
     // 1. Chain + trace binding.
     match transcript.replay_chain() {
         ChainCheck::Ok => {}

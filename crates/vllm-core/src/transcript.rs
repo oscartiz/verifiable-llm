@@ -84,6 +84,41 @@ pub enum ChainCheck {
 }
 
 impl Transcript {
+    /// Structural sanity checks that must hold before any position arithmetic.
+    /// A transcript is attacker-controlled JSON, so these guard the
+    /// `prompt_len - 1` / `n_positions - first_logit_pos` computations
+    /// downstream against underflow (a debug panic / release wraparound):
+    /// every command that consumes a transcript should call this right after
+    /// deserialization, so malformed input fails closed with a clear error
+    /// instead of panicking or silently producing garbage.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.prompt_token_ids.is_empty() {
+            return Err("transcript has an empty prompt (prompt_token_ids)".into());
+        }
+        if let Some(trace) = &self.trace {
+            if trace.n_layers == 0 {
+                return Err("trace commitment declares zero layers".into());
+            }
+            if trace.hidden_dim == 0 {
+                return Err("trace commitment declares zero hidden_dim".into());
+            }
+            if trace.n_positions == 0 {
+                return Err("trace commitment declares zero positions".into());
+            }
+            // first_logit_pos = prompt_len - 1 must index a real position, so
+            // that n_positions - first_logit_pos (the head-cell count) cannot
+            // underflow.
+            let first_logit_pos = self.prompt_token_ids.len() - 1;
+            if first_logit_pos > trace.n_positions as usize {
+                return Err(format!(
+                    "first logit position {first_logit_pos} is beyond the {} trace positions",
+                    trace.n_positions
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Recompute the chain from the recorded inputs and compare it with the
     /// recorded per-step values. This proves the transcript is internally
     /// consistent — it does NOT prove the logits came from the model; that is
@@ -131,6 +166,7 @@ impl Transcript {
     /// layer_hashes) — which replay_chain has bound into final_chain — must
     /// equal trace.root. Returns an error message on any inconsistency.
     pub fn check_trace_binding(&self) -> Result<(), String> {
+        self.validate()?;
         let trace = self
             .trace
             .as_ref()
@@ -260,6 +296,43 @@ mod tests {
             truncated.replay_chain(),
             ChainCheck::BadFinal { .. }
         ));
+    }
+
+    #[test]
+    fn empty_prompt_fails_closed_no_panic() {
+        // An attacker-crafted transcript with an empty prompt must be rejected
+        // by validate() and check_trace_binding() — not underflow-panic on the
+        // prompt_len - 1 arithmetic (regression: transcript.rs used to do this
+        // subtraction unchecked).
+        let mut t = build(|_| {});
+        t.prompt_token_ids.clear();
+        assert!(t.validate().is_err());
+        // check_trace_binding must also fail closed (validate runs first).
+        assert!(t.check_trace_binding().is_err());
+        // With a trace attached the same must hold (this is the path that used
+        // to panic in debug / wrap in release).
+        t.trace = Some(TraceInfo {
+            root: Hash32([0u8; 32]),
+            n_positions: 1,
+            n_layers: 2,
+            hidden_dim: 4,
+            frac_bits: 16,
+        });
+        assert!(t.validate().is_err());
+        assert!(t.check_trace_binding().is_err());
+    }
+
+    #[test]
+    fn degenerate_trace_dims_are_rejected() {
+        let mut t = build(|_| {});
+        t.trace = Some(TraceInfo {
+            root: Hash32([0u8; 32]),
+            n_positions: 0, // zero positions
+            n_layers: 2,
+            hidden_dim: 4,
+            frac_bits: 16,
+        });
+        assert!(t.validate().is_err());
     }
 
     #[test]
